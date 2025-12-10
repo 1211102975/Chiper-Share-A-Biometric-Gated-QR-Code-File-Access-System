@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureDoc - Secure Document Sharing</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --card-shadow: 0 10px 25px rgba(0, 0, 0, 0.08);
+            --card-hover: 0 15px 35px rgba(0, 0, 0, 0.12);
+        }
+
+        * {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #1e293b;
+        }
+
+        .navbar {
+            background: rgba(255, 255, 255, 0.95) !important;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
+            padding: 1rem 0;
+        }
+
+        .navbar-brand {
+            font-size: 1.5rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .main-container {
+            max-width: 1000px;
+            margin: 3rem auto;
+            padding: 0 1rem;
+        }
+
+        .page-header {
+            text-align: center;
+            color: white;
+            margin-bottom: 3rem;
+        }
+
+        .page-header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .page-header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .nav-tabs {
+            border: none;
+            gap: 1rem;
+            margin-bottom: 2rem;
+            padding: 0.5rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }
+
+        .nav-link {
+            border: none;
+            color: rgba(255, 255, 255, 0.8);
+            font-weight: 600;
+            padding: 0.75rem 1.5rem;
+            border-radius: 10px;
+            transition: all 0.3s ease;
+        }
+
+        .nav-link:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+        }
+
+        .nav-link.active {
+            background: white !important;
+            color: var(--primary) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        .card {
+            border: none;
+            border-radius: 20px;
+            box-shadow: var(--card-shadow);
+            transition: all 0.3s ease;
+            overflow: hidden;
+            background: white;
+            margin-bottom: 2rem;
+        }
+
+        .card:hover {
+            box-shadow: var(--card-hover);
+            transform: translateY(-5px);
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            padding: 1.5rem;
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+
+        .card-body {
+            padding: 2rem;
+        }
+
+        .form-label {
+            font-weight: 600;
+            color: #334155;
+            margin-bottom: 0.75rem;
+        }
+
+        .form-control, .form-select {
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .btn {
+            border-radius: 10px;
+            font-weight: 600;
+            padding: 0.75rem 1.5rem;
+            transition: all 0.3s ease;
+            border: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, var(--primary-dark), var(--primary));
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(99, 102, 241, 0.4);
+            color: white;
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, var(--success), #059669);
+            color: white;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            color: white;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--danger), #dc2626);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            color: white;
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--warning), #d97706);
+            color: white;
+        }
+
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            color: white;
+        }
+
+        .btn-outline-primary {
+            border: 2px solid var(--primary);
+            color: var(--primary);
+        }
+
+        .btn-check:checked + .btn-outline-primary {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: white;
+        }
+
+        .result-box {
+            display: none;
+            margin-top: 2rem;
+            padding: 1.5rem;
+            border-radius: 15px;
+            background: linear-gradient(135deg, #f0f4ff, #f5f3ff);
+            border-left: 5px solid var(--primary);
+            animation: slideIn 0.4s ease;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .camera-container {
+            position: relative;
+            width: 100%;
+            max-width: 600px;
+            margin: 0 auto 1.5rem;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
+        }
+
+        #videoElement {
+            width: 100%;
+            display: block;
+            background: #000;
+        }
+
+        #qrImage {
+            max-width: 300px;
+            margin: 1rem auto;
+            display: block;
+        }
+
+        .verification-success {
+            background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+            color: #065f46;
+            padding: 1rem;
+            border-radius: 10px;
+        }
+
+        .verification-failure {
+            background: linear-gradient(135deg, #fee2e2, #fecaca);
+            color: #7c2d12;
+            padding: 1rem;
+            border-radius: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .page-header h1 {
+                font-size: 1.8rem;
+            }
+            .btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <div class="container-lg">
+            <a class="navbar-brand fw-bold" href="{{ url_for('dashboard') }}">
+                <i class="bi bi-lock-fill"></i> SecureDoc
+            </a>
+            <div class="d-flex align-items-center gap-3 ms-auto">
+                <span class="text-muted mb-0">Hi, <strong>{{ user.name if user else 'Guest' }}</strong></span>
+                {% if user %}
+                <div class="dropdown">
+                    <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" id="userDropdown" data-bs-toggle="dropdown">
+                        <i class="bi bi-person-circle"></i>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
+                        <li><a class="dropdown-item" href="{{ url_for('profile') }}"><i class="bi bi-person"></i> Profile</a></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item text-danger" href="{{ url_for('logout') }}"><i class="bi bi-box-arrow-right"></i> Logout</a></li>
+                    </ul>
+                </div>
+                {% else %}
+                <a class="btn btn-outline-primary btn-sm" href="{{ url_for('login') }}">Login</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <div class="main-container">
+        <div class="page-header">
+            <h1><i class="bi bi-shield-lock"></i> Secure Document Sharing</h1>
+            <p>Upload, encrypt, and share documents securely with QR codes</p>
+        </div>
+
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="upload-tab" data-bs-toggle="tab" data-bs-target="#upload" type="button">
+                    <i class="bi bi-cloud-upload"></i> Upload Document
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="scan-tab" data-bs-toggle="tab" data-bs-target="#scan" type="button">
+                    <i class="bi bi-qr-code"></i> Scan QR Code
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content" id="myTabContent">
+            <!-- Upload Tab -->
+            <div class="tab-pane fade show active" id="upload" role="tabpanel">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-file-earmark-arrow-up"></i> Upload Your Document
+                    </div>
+                    <div class="card-body">
+                        <form id="uploadForm">
+                            <div class="mb-4">
+                                <label class="form-label"><i class="bi bi-file-type-pdf"></i> Choose Document Source</label>
+                                <div class="btn-group w-100" role="group">
+                                    <input type="radio" class="btn-check" name="docSource" id="docFile" value="file" checked>
+                                    <label class="btn btn-outline-primary" for="docFile">
+                                        <i class="bi bi-arrow-down-circle"></i> Upload File
+                                    </label>
+                                    <input type="radio" class="btn-check" name="docSource" id="docLink" value="link">
+                                    <label class="btn btn-outline-primary" for="docLink">
+                                        <i class="bi bi-link-45deg"></i> File Link
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="mb-4" id="fileInputDiv">
+                                <label for="document" class="form-label"><i class="bi bi-file-earmark"></i> Select Document</label>
+                                <input type="file" class="form-control" id="document" accept=".pdf,.docx">
+                            </div>
+
+                            <div class="mb-4" id="linkInputDiv" style="display:none;">
+                                <label for="fileLink" class="form-label"><i class="bi bi-globe"></i> File URL</label>
+                                <input type="url" class="form-control" id="fileLink" placeholder="https://example.com/document.pdf">
+                            </div>
+
+                            <div class="mb-4">
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <label class="form-label mb-0"><i class="bi bi-people"></i> Receivers</label>
+                                    <button type="button" class="btn btn-sm btn-outline-primary" id="addReceiverBtn">
+                                        <i class="bi bi-plus-circle"></i> Add Receiver
+                                    </button>
+                                </div>
+                                <div id="receiversContainer">
+                                    <!-- Receiver 1 -->
+                                    <div class="receiver-section mb-3 p-3 border rounded" data-receiver-index="1">
+                                        <div class="d-flex justify-content-between align-items-center mb-2">
+                                            <h6 class="mb-0"><i class="bi bi-person"></i> Receiver 1</h6>
+                                            <button type="button" class="btn btn-sm btn-outline-danger remove-receiver" style="display: none;">
+                                                <i class="bi bi-trash"></i> Remove
+                                            </button>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label"><i class="bi bi-camera-fill"></i> Receiver's Photo</label>
+                                            <input type="file" class="form-control receiver-photo" accept="image/*" required>
+                                        </div>
+                                        <div class="mb-2">
+                                            <label class="form-label"><i class="bi bi-envelope"></i> Receiver's Email Address</label>
+                                            <input type="email" class="form-control receiver-email" value="{{ user.email if user else '' }}" required>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="mb-4">
+                                <label for="expiration_hours" class="form-label"><i class="bi bi-clock"></i> QR Code Validity Period</label>
+                                <div class="input-group">
+                                    <input type="number" class="form-control" id="expiration_hours" min="1" step="1" value="24" required>
+                                    <select class="form-select" id="expiration_unit" style="max-width: 120px;">
+                                        <option value="hours">Hours</option>
+                                        <option value="days">Days</option>
+                                    </select>
+                                </div>
+                                <small class="form-text text-muted">How long should this QR code remain valid? (Default: 24 hours)</small>
+                            </div>
+
+                            <button type="submit" class="btn btn-primary w-100">
+                                <i class="bi bi-check-circle"></i> Generate QR Code
+                            </button>
+                        </form>
+
+                        <div id="uploadResult" class="result-box" style="display: none;">
+                            <h4><i class="bi bi-check-circle-fill"></i> Success! QR Code(s) Generated</h4>
+                            <div id="qrCodesContainer">
+                                <!-- QR codes will be dynamically inserted here -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Scan Tab -->
+            <div class="tab-pane fade" id="scan" role="tabpanel">
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-qr-code-scan"></i> Scan & Verify Document
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-4">
+                            <label for="qrFile" class="form-label"><i class="bi bi-image"></i> Upload QR Code Image</label>
+                            <input type="file" class="form-control" id="qrFile" accept="image/*">
+                        </div>
+                        <button class="btn btn-primary w-100" onclick="scanQR()">
+                            <i class="bi bi-search"></i> Scan QR Code
+                        </button>
+
+                        <div id="scanError" class="result-box" style="display: none; border-left-color: var(--danger); background: linear-gradient(135deg, #fee2e2, #fecaca);">
+                            <h4 style="color: var(--danger);"><i class="bi bi-exclamation-triangle-fill"></i> QR Code Expired</h4>
+                            <p id="scanErrorMessage" class="text-muted"></p>
+                        </div>
+
+                        <div id="faceVerification" class="result-box">
+                            <h4><i class="bi bi-camera-video"></i> Face Verification</h4>
+                            <div class="camera-container">
+                                <video id="videoElement" autoplay></video>
+                                <canvas id="overlayCanvas" style="position: absolute; top: 0; left: 0;"></canvas>
+                            </div>
+                            <div class="d-grid gap-2">
+                                <button class="btn btn-primary" onclick="startCamera()"><i class="bi bi-camera"></i> Start Camera</button>
+                                <button class="btn btn-danger" onclick="stopCamera()"><i class="bi bi-stop-circle"></i> Stop Camera</button>
+                                <button class="btn btn-success" onclick="captureAndVerify()"><i class="bi bi-check-lg"></i> Capture & Verify</button>
+                            </div>
+                            <div id="verificationStatus" class="mt-3">
+                                <p class="text-muted"><i class="bi bi-info-circle"></i> Face verification is required to proceed</p>
+                            </div>
+                        </div>
+
+                        <div id="otpVerification" class="result-box">
+                            <h4><i class="bi bi-shield-lock"></i> Enter OTP</h4>
+                            <p class="text-muted">An OTP has been sent to your email</p>
+                            <div class="input-group mb-3">
+                                <input type="text" class="form-control" id="otpInput" placeholder="Enter 6-digit OTP" maxlength="6">
+                                <button class="btn btn-primary" onclick="verifyOTP()"><i class="bi bi-check-circle"></i> Verify</button>
+                            </div>
+                        </div>
+
+                        <div id="downloadSection" class="result-box" style="border-left-color: var(--success); background: linear-gradient(135deg, #d1fae5, #a7f3d0);">
+                            <h4 style="color: var(--success);"><i class="bi bi-check-circle-fill"></i> Verification Successful!</h4>
+                            <p class="text-muted">Your document is ready</p>
+                            <button class="btn btn-success w-100" onclick="downloadDocument()">
+                                <i class="bi bi-download"></i> Download Document
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let stream = null;
+        let isVerifying = false;
+        let verificationInterval = null;
+        let faceVerificationComplete = false;
+
+        // Toggle document source
+        document.querySelectorAll('input[name="docSource"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                if (e.target.value === 'file') {
+                    document.getElementById('fileInputDiv').style.display = 'block';
+                    document.getElementById('linkInputDiv').style.display = 'none';
+                } else {
+                    document.getElementById('fileInputDiv').style.display = 'none';
+                    document.getElementById('linkInputDiv').style.display = 'block';
+                }
+            });
+        });
+
+        // Add Receiver functionality
+        let receiverCount = 1;
+        document.getElementById('addReceiverBtn').addEventListener('click', function() {
+            receiverCount++;
+            const receiversContainer = document.getElementById('receiversContainer');
+            const newReceiverSection = document.createElement('div');
+            newReceiverSection.className = 'receiver-section mb-3 p-3 border rounded';
+            newReceiverSection.setAttribute('data-receiver-index', receiverCount);
+            newReceiverSection.innerHTML = `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <h6 class="mb-0"><i class="bi bi-person"></i> Receiver ${receiverCount}</h6>
+                    <button type="button" class="btn btn-sm btn-outline-danger remove-receiver">
+                        <i class="bi bi-trash"></i> Remove
+                    </button>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label"><i class="bi bi-camera-fill"></i> Receiver's Photo</label>
+                    <input type="file" class="form-control receiver-photo" accept="image/*" required>
+                </div>
+                <div class="mb-2">
+                    <label class="form-label"><i class="bi bi-envelope"></i> Receiver's Email Address</label>
+                    <input type="email" class="form-control receiver-email" required>
+                </div>
+            `;
+            receiversContainer.appendChild(newReceiverSection);
+            
+            // Show remove buttons for all receivers when there's more than one
+            updateRemoveButtons();
+        });
+
+        // Remove Receiver functionality
+        document.addEventListener('click', function(e) {
+            if (e.target.closest('.remove-receiver')) {
+                const receiverSection = e.target.closest('.receiver-section');
+                receiverSection.remove();
+                receiverCount--;
+                updateReceiverNumbers();
+                updateRemoveButtons();
+            }
+        });
+
+        // Update receiver numbers after removal
+        function updateReceiverNumbers() {
+            const receivers = document.querySelectorAll('.receiver-section');
+            receivers.forEach((receiver, index) => {
+                const receiverNumber = index + 1;
+                receiver.setAttribute('data-receiver-index', receiverNumber);
+                receiver.querySelector('h6').innerHTML = `<i class="bi bi-person"></i> Receiver ${receiverNumber}`;
+            });
+            receiverCount = receivers.length;
+        }
+
+        // Show/hide remove buttons based on receiver count
+        function updateRemoveButtons() {
+            const receivers = document.querySelectorAll('.receiver-section');
+            const removeButtons = document.querySelectorAll('.remove-receiver');
+            if (receivers.length > 1) {
+                removeButtons.forEach(btn => btn.style.display = 'block');
+            } else {
+                removeButtons.forEach(btn => btn.style.display = 'none');
+            }
+        }
+
+        // Upload Document
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const docSource = document.querySelector('input[name="docSource"]:checked').value;
+            const formData = new FormData();
+
+            if (docSource === 'file') {
+                const docFile = document.getElementById('document').files[0];
+                if (!docFile) {
+                    alert('Please select a document file');
+                    return;
+                }
+                formData.append('document', docFile);
+            } else {
+                const fileLink = document.getElementById('fileLink').value;
+                if (!fileLink) {
+                    alert('Please enter a file link');
+                    return;
+                }
+                formData.append('fileLink', fileLink);
+            }
+
+            // Collect all receiver photos and emails
+            const receiverSections = document.querySelectorAll('.receiver-section');
+            const photos = [];
+            const emails = [];
+            let validationError = false;
+            
+            receiverSections.forEach((section, index) => {
+                const photoInput = section.querySelector('.receiver-photo');
+                const emailInput = section.querySelector('.receiver-email');
+                
+                if (!photoInput.files[0]) {
+                    alert(`Please select a photo for Receiver ${index + 1}`);
+                    validationError = true;
+                    return;
+                }
+                if (!emailInput.value.trim()) {
+                    alert(`Please enter an email for Receiver ${index + 1}`);
+                    validationError = true;
+                    return;
+                }
+                
+                photos.push(photoInput.files[0]);
+                emails.push(emailInput.value.trim());
+            });
+
+            if (validationError) {
+                return;
+            }
+
+            if (photos.length === 0 || emails.length === 0) {
+                alert('Please add at least one receiver with photo and email');
+                return;
+            }
+
+            // Append all photos and emails
+            photos.forEach((photo, index) => {
+                formData.append(`photo_${index}`, photo);
+            });
+            emails.forEach((email, index) => {
+                formData.append(`email_${index}`, email);
+            });
+            
+            // Calculate expiration hours based on unit selected
+            const expirationValue = parseFloat(document.getElementById('expiration_hours').value);
+            const expirationUnit = document.getElementById('expiration_unit').value;
+            const expirationHours = expirationUnit === 'days' ? expirationValue * 24 : expirationValue;
+            formData.append('expiration_hours', expirationHours);
+
+            try {
+                const response = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await response.json();
+
+                if (data.success) {
+                    const uploadResult = document.getElementById('uploadResult');
+                    const qrCodesContainer = document.getElementById('qrCodesContainer');
+                    qrCodesContainer.innerHTML = ''; // Clear previous results
+                    
+                    // Handle multiple QR codes
+                    if (data.qr_codes && data.qr_codes.length > 0) {
+                        data.qr_codes.forEach((qrData, index) => {
+                            const qrCard = document.createElement('div');
+                            qrCard.className = 'mb-4 p-3 border rounded';
+                            qrCard.innerHTML = `
+                                <h6 class="mb-2"><i class="bi bi-person"></i> Receiver ${index + 1}: ${qrData.email}</h6>
+                                <div style="text-align: center; margin-bottom: 10px;">
+                                    <img src="${qrData.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 250px;">
+                                </div>
+                                <div style="text-align: center;">
+                                    <button class="btn btn-success download-qr-btn" data-qr-path="${qrData.qr_path}" data-email="${qrData.email}">
+                                        <i class="bi bi-download"></i> Download QR Code
+                                    </button>
+                                </div>
+                            `;
+                            qrCodesContainer.appendChild(qrCard);
+                        });
+                        
+                        // Add download functionality to all download buttons
+                        document.querySelectorAll('.download-qr-btn').forEach(btn => {
+                            btn.addEventListener('click', function(e) {
+                                e.preventDefault();
+                                const qrPath = this.getAttribute('data-qr-path');
+                                const email = this.getAttribute('data-email');
+                                fetch(qrPath)
+                                    .then(r => r.blob())
+                                    .then(blob => {
+                                        const url = window.URL.createObjectURL(blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = `qr_code_${email}.png`;
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        window.URL.revokeObjectURL(url);
+                                        document.body.removeChild(a);
+                                    });
+                            });
+                        });
+                    } else if (data.qr_path) {
+                        // Fallback for single QR code (backward compatibility)
+                        qrCodesContainer.innerHTML = `
+                            <div style="text-align: center;">
+                                <img src="${data.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 300px;">
+                            </div>
+                            <div class="mt-3" style="text-align: center;">
+                                <button class="btn btn-success" onclick="downloadQR('${data.qr_path}')">
+                                    <i class="bi bi-download"></i> Download QR Code
+                                </button>
+                            </div>
+                        `;
+                    }
+                    
+                    uploadResult.style.display = 'block';
+                } else {
+                    alert(data.error || 'Upload failed');
+                }
+            } catch (error) {
+                alert('Error during upload');
+            }
+        });
+
+        // Scan QR
+        async function scanQR() {
+            const fileInput = document.getElementById('qrFile');
+            if (!fileInput.files.length) {
+                alert('Please select a QR code image');
+                return;
+            }
+
+            // Hide previous results
+            document.getElementById('faceVerification').style.display = 'none';
+            document.getElementById('scanError').style.display = 'none';
+            document.getElementById('otpVerification').style.display = 'none';
+            document.getElementById('downloadSection').style.display = 'none';
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            try {
+                const response = await fetch('/scan', { method: 'POST', body: formData });
+                const data = await response.json();
+
+                if (data.success) {
+                    document.getElementById('faceVerification').style.display = 'block';
+                } else {
+                    // Check if QR code is expired
+                    if (data.expired) {
+                        document.getElementById('scanErrorMessage').textContent = data.message || data.error || 'This QR code has expired and is no longer valid.';
+                        document.getElementById('scanError').style.display = 'block';
+                    } else {
+                        alert(data.error || 'Failed to scan QR code');
+                    }
+                }
+            } catch (error) {
+                alert('Error scanning QR code');
+            }
+        }
+
+        // Camera
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 720 }, height: { ideal: 720 } } });
+                const videoElement = document.getElementById('videoElement');
+                videoElement.srcObject = stream;
+                startFaceVerification();
+            } catch (err) {
+                alert('Error accessing camera: ' + err.message);
+            }
+        }
+
+        function stopCamera() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                document.getElementById('videoElement').srcObject = null;
+            }
+            stopFaceVerification();
+        }
+
+
+
+        function startFaceVerification() {
+            if (verificationInterval) return;
+            isVerifying = true;
+            verificationInterval = setInterval(async () => {
+                if (!isVerifying) return;
+                const video = document.getElementById('videoElement');
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
+
+                canvas.toBlob(async (blob) => {
+                    if (!blob) return;
+                    const formData = new FormData();
+                    formData.append('frame', blob, 'frame.jpg');
+
+                    try {
+                        const response = await fetch('/verify_face_stream', { method: 'POST', body: formData });
+                        const data = await response.json();
+
+                        if (data.error === 'Face recognition is not available on this system') {
+                            stopFaceVerification();
+                            alert('Face recognition is required on this system. Please ensure face_recognition package is installed.');
+                        } else if (data.success) {
+                            // Face verification successful
+                            faceVerificationComplete = true;
+                            stopCamera();
+                            document.getElementById('faceVerification').style.display = 'none';
+                            document.getElementById('otpVerification').style.display = 'block';
+                            document.getElementById('verificationStatus').innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill"></i> Face verification successful! Now enter your OTP.</div>';
+                        }
+                    } catch (error) {}
+                });
+            }, 1000);
+        }
+
+        function stopFaceVerification() {
+            isVerifying = false;
+            if (verificationInterval) {
+                clearInterval(verificationInterval);
+                verificationInterval = null;
+            }
+        }
+
+        function captureAndVerify() {
+            if (faceVerificationComplete) {
+                alert('Face verification already completed. Please enter your OTP.');
+            } else {
+                alert('Waiting for face verification... Keep your face in the camera frame.');
+            }
+        }
+
+        async function verifyOTP() {
+            if (!faceVerificationComplete) {
+                alert('Please complete face verification first before entering OTP.');
+                return;
+            }
+
+            const otp = document.getElementById('otpInput').value;
+            if (!otp) {
+                alert('Please enter the OTP');
+                return;
+            }
+
+            try {
+                const response = await fetch('/verify_otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ otp, face_verified: faceVerificationComplete })
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    document.getElementById('otpVerification').style.display = 'none';
+                    document.getElementById('downloadSection').style.display = 'block';
+                    window.downloadURL = data.file_link;
+                } else {
+                    alert(data.error);
+                }
+            } catch (error) {
+                alert('OTP verification error');
+            }
+        }
+
+        function downloadDocument() {
+            if (window.downloadURL) {
+                window.open(window.downloadURL, '_blank');
+            }
+        }
+    </script>
+</body>
+</html>
