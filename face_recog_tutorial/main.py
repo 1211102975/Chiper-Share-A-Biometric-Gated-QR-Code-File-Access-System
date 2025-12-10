@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     # Initialize video capture thread
     print("Initializing Camera...")
-    video_capture = VideoCaptureThread(src=1, width=720, height=720, queue_size=2)
+    video_capture = VideoCaptureThread(src=0, width=720, height=720, queue_size=2)
     video_capture.start()
     print("Started Video Thread...")
 

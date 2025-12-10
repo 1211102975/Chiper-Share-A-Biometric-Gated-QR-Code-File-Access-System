@@ -342,7 +342,7 @@ def verify_face_with_mediapipe():
     known_face_encodings, known_face_names = load_known_faces(app.config['KNOWN_FACES'])
     
     # Initialize camera
-    video_capture = VideoCaptureThread(src=1, width=720, height=720, queue_size=2)
+    video_capture = VideoCaptureThread(src=0, width=720, height=720, queue_size=2)
     video_capture.start()
     
     try:
@@ -413,10 +413,16 @@ def generate_otp():
 
 def send_otp_email(recipient_email, otp):
     try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
+        print(f"Attempting to send email to: {recipient_email}")
+        print(f"Connecting to SMTP server: smtp.gmail.com:587")
+        server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
+        server.set_debuglevel(1)  # Enable debug output
+        
+        print("Starting TLS...")
         server.starttls()
         
         from_mail = 'cyloixy2610@gmail.com'
+        print(f"Logging in with email: {from_mail}")
         server.login(from_mail, 'jnzb bvae knot evss')
         
         msg = EmailMessage()
@@ -425,13 +431,25 @@ def send_otp_email(recipient_email, otp):
         msg['To'] = recipient_email
         msg.set_content(f"Your OTP is: {otp}")
         
-        print("Sending email...")
+        print(f"Sending email with OTP: {otp}")
         server.send_message(msg)
-        print("Email sent successfully")
+        print("Email sent successfully!")
         server.quit()
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"SMTP Authentication Error: {e}")
+        print("Please check if:")
+        print("1. 2-Factor Authentication is enabled on Gmail")
+        print("2. App Password is correctly generated")
+        print("3. 'Less secure app access' is enabled (if not using App Password)")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"SMTP Error: {e}")
+        return False
     except Exception as e:
-        print(f"Email error: {e}")
+        print(f"Unexpected email error: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 @app.route('/')

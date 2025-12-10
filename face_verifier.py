@@ -105,7 +105,7 @@ def face_recognition_pipeline(known_faces_dir="known_faces"):
     known_face_encodings, known_face_names = load_known_faces(known_faces_dir)
     
     # Initialize camera
-    video_capture = VideoCaptureThread(src=1, width=720, height=720, queue_size=2)
+    video_capture = VideoCaptureThread(src=0, width=720, height=720, queue_size=2)
     video_capture.start()
     
     try:
@@ -169,7 +169,7 @@ if __name__ == "__main__":
     known_face_encodings, known_face_names = load_known_faces(known_faces_dir)
 
     print("Initializing Camera...")
-    video_capture = VideoCaptureThread(src=1, width=720, height=720, queue_size=2)
+    video_capture = VideoCaptureThread(src=0, width=720, height=720, queue_size=2)
     video_capture.start()
     print("Started Video Thread...")
 
