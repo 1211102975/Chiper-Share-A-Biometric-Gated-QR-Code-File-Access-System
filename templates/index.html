@@ -432,13 +432,8 @@
                                 <video id="videoElement" autoplay></video>
                                 <canvas id="overlayCanvas" style="position: absolute; top: 0; left: 0;"></canvas>
                             </div>
-                            <div class="d-grid gap-2">
-                                <button class="btn btn-primary" onclick="startCamera()"><i class="bi bi-camera"></i> Start Camera</button>
-                                <button class="btn btn-danger" onclick="stopCamera()"><i class="bi bi-stop-circle"></i> Stop Camera</button>
-                                <button class="btn btn-success" onclick="captureAndVerify()"><i class="bi bi-check-lg"></i> Capture & Verify</button>
-                            </div>
                             <div id="verificationStatus" class="mt-3">
-                                <p class="text-muted"><i class="bi bi-info-circle"></i> Face verification is required to proceed</p>
+                                <p class="text-muted"><i class="bi bi-spinner"></i> Verifying your face... Keep your face in the camera frame.</p>
                             </div>
                         </div>
 
@@ -470,6 +465,7 @@
         let isVerifying = false;
         let verificationInterval = null;
         let faceVerificationComplete = false;
+        let otpRequestInProgress = false;  // Prevent multiple OTP requests
 
         // Toggle document source
         document.querySelectorAll('input[name="docSource"]').forEach(radio => {
@@ -711,6 +707,8 @@
 
                 if (data.success) {
                     document.getElementById('faceVerification').style.display = 'block';
+                    // Auto-start camera and face verification
+                    startCamera();
                 } else {
                     // Check if QR code is expired
                     if (data.expired) {
@@ -773,11 +771,34 @@
                             alert('Face recognition is required on this system. Please ensure face_recognition package is installed.');
                         } else if (data.success) {
                             // Face verification successful
-                            faceVerificationComplete = true;
-                            stopCamera();
-                            document.getElementById('faceVerification').style.display = 'none';
-                            document.getElementById('otpVerification').style.display = 'block';
-                            document.getElementById('verificationStatus').innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill"></i> Face verification successful! Now enter your OTP.</div>';
+                            if (!faceVerificationComplete && !otpRequestInProgress) {
+                                faceVerificationComplete = true;
+                                otpRequestInProgress = true;  // Set flag to prevent duplicate requests
+                                stopCamera();
+                                
+                                // Generate and send OTP
+                                try {
+                                    const otpResponse = await fetch('/send_otp', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' }
+                                    });
+                                    const otpData = await otpResponse.json();
+                                    
+                                    if (otpData.success) {
+                                        console.log('OTP sent successfully');
+                                        document.getElementById('faceVerification').style.display = 'none';
+                                        document.getElementById('otpVerification').style.display = 'block';
+                                        document.getElementById('verificationStatus').innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill"></i> Face verification successful! OTP sent to your email. Now enter your OTP.</div>';
+                                    } else {
+                                        alert('Failed to send OTP: ' + (otpData.error || 'Unknown error'));
+                                        otpRequestInProgress = false;  // Reset flag on error
+                                    }
+                                } catch (otpError) {
+                                    console.error('Error sending OTP:', otpError);
+                                    alert('Error sending OTP');
+                                    otpRequestInProgress = false;  // Reset flag on error
+                                }
+                            }
                         }
                     } catch (error) {}
                 });
@@ -795,8 +816,6 @@
         function captureAndVerify() {
             if (faceVerificationComplete) {
                 alert('Face verification already completed. Please enter your OTP.');
-            } else {
-                alert('Waiting for face verification... Keep your face in the camera frame.');
             }
         }
 

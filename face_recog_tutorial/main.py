@@ -55,7 +55,7 @@ def load_known_faces(directory):
 
 # Thread class for video capture
 class VideoCaptureThread(threading.Thread):
-    def __init__(self, src=0, width=640, height=480, queue_size=2):
+    def __init__(self, src=0, width=640, height=450, queue_size=2):
         super().__init__()
         self.capture = cv2.VideoCapture(src, cv2.CAP_DSHOW)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
