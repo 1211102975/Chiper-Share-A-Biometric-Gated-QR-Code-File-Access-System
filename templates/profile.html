@@ -240,8 +240,7 @@
 
         <div class="profile-card">
             <div class="profile-card-header">
-                <img src="{{ profile_picture_url or url_for('static', filename='profile_pics/default.png') }}" 
-                     alt="Profile picture" class="profile-picture">
+                <img src="{{ url_for('get_profile_picture', user_id=user.user_id) }}" alt="Profile picture" class="profile-picture">
                 <h2>{{ user.name }}</h2>
                 <p class="email"><i class="bi bi-envelope"></i> {{ user.email }}</p>
             </div>

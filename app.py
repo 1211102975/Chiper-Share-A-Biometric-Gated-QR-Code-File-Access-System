@@ -7,6 +7,7 @@ from flask import (
     redirect,
     url_for,
     send_from_directory,
+    Response,
 )
 import os
 import cv2
@@ -22,7 +23,7 @@ import face_recognition
 
 
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from pyzbar.pyzbar import decode
 import mediapipe as mp
 import threading
@@ -35,25 +36,28 @@ from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from db import get_db_connection
 from face_verifier import face_recognition_pipeline
+import base64
+import io
+
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+
 
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-# app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-# app.config['KNOWN_FACES'] = os.path.join(BASE_DIR, 'known_faces')
-app.config['PROFILE_PIC_FOLDER'] = os.path.join(BASE_DIR, 'static', 'profile_pics')
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER  # Set config for consistency
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-# USER_DATA_DIR = os.path.join(BASE_DIR, 'data')
-# USER_DATA_FILE = os.path.join(USER_DATA_DIR, 'users.json')
+
 PROFILE_PIC_URL_PREFIX = 'profile_pics'
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 ALLOWED_DOCUMENT_EXTENSIONS = {'pdf', 'docx'}
 
-# os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-# os.makedirs(app.config['KNOWN_FACES'], exist_ok=True)
-os.makedirs(app.config['PROFILE_PIC_FOLDER'], exist_ok=True)
+# Create necessary directories
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # os.makedirs(USER_DATA_DIR, exist_ok=True)
 
 SMTP_SERVER = "smtp.gmail.com"
@@ -122,9 +126,9 @@ def get_current_user():
     cursor = conn.cursor()
 
     try:
-        # Adjust selected columns if your Users table has different schema
+        # Get user data including profile_picture from database
         cursor.execute(
-            "SELECT user_id, name, email FROM Users WHERE user_id = ?",
+            "SELECT user_id, name, email, COALESCE(profile_picture, 'default.png') FROM Users WHERE user_id = ?",
             user_id
         )
         row = cursor.fetchone()
@@ -134,12 +138,12 @@ def get_current_user():
     if not row:
         return None
 
-    # Basic user dict; profile_picture uses a default for now
+    # Return user dict with profile_picture from database
     return {
         'user_id': row[0],
         'name': row[1],
         'email': row[2],
-        'profile_picture': 'default.png',
+        'profile_picture': row[3] if row[3] else 'default.png',
     }
 
 
@@ -177,8 +181,8 @@ def save_profile_picture(file, email):
     )
     extension = file.filename.rsplit('.', 1)[1].lower()
     stored_name = f"{filename}.{extension}"
-    save_path = os.path.join(app.config['PROFILE_PIC_FOLDER'], stored_name)
-    file.save(save_path)
+    # save_path = os.path.join(app.config['PROFILE_PIC_FOLDER'], stored_name)
+    # file.save(save_path)
     return stored_name
 
 
@@ -198,7 +202,7 @@ def dashboard():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT user_id, email
+        SELECT user_id, name, email, COALESCE(profile_picture, 'default.png')
         FROM Users
         WHERE user_id = ?
     """, user_id)
@@ -211,7 +215,9 @@ def dashboard():
 
     user = {
         'user_id': row[0],
-        'email': row[1]
+        'name': row[1],
+        'email': row[2],
+        'profile_picture': row[3] if row[3] else 'default.png'
     }
 
     return render_template('index.html', user=user)
@@ -222,25 +228,69 @@ def login():
     if request.method == 'GET':
         return render_template('login.html')
 
-    email = request.form['email']
-    password = request.form['password']
+    # Normalize email (lowercase and strip) to match registration
+    email = request.form.get('email', '').strip().lower()
+    password = request.form.get('password', '')
+
+    if not email or not password:
+        return render_template('login.html', error='Email and password are required')
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT user_id, password FROM Users WHERE email = ?",
-        email
-    )
+    try:
+        cursor.execute(
+            "SELECT user_id, password FROM Users WHERE email = ?",
+            email
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            print(f"Login attempt: User with email '{email}' not found in database")
+            return render_template('login.html', error='Invalid email or password')
+        
+        user_id, password_hash = row[0], row[1]
+        
+        # Check if password hash is valid
+        if not password_hash:
+            print(f"Login attempt: User {user_id} has no password hash")
+            return render_template('login.html', error='Account error. Please contact support.')
+        
+        # Verify password
+        if check_password_hash(password_hash, password):
+            session['user_id'] = user_id
+            session['user_email'] = email
+            print(f"Login successful: User {user_id} ({email})")
+            return redirect(url_for('dashboard'))
+        else:
+            print(f"Login attempt: Invalid password for user {user_id} ({email})")
+            return render_template('login.html', error='Invalid email or password')
+            
+    except Exception as e:
+        print(f"Login error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return render_template('login.html', error='Login error. Please try again.')
+    finally:
+        conn.close()
+
+@app.route('/profile_picture/<int:user_id>')
+@login_required
+def get_profile_picture(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT profile_picture, profile_picture_mime
+        FROM Users WHERE user_id = ?
+    """, user_id)
+
     row = cursor.fetchone()
     conn.close()
 
-    if row and check_password_hash(row[1], password):
-        session['user_id'] = row[0]      # INTERNAL
-        session['user_email'] = email   # EMAIL ONLY
-        return redirect(url_for('dashboard'))
+    if not row or not row[0]:
+        return '', 404
 
-    return "Invalid credentials", 401
-
+    return Response(row[0], mimetype=row[1])
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -255,7 +305,8 @@ def register():
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
         confirm_password = request.form.get('confirm_password', '')
-
+        profile_blob = None
+        profile_mime = None
         if not name or not email or not password:
             error = 'All fields are required'
         elif password != confirm_password:
@@ -272,10 +323,27 @@ def register():
             if cursor.fetchone():
                 error = 'An account with this email already exists'
             else:
+                # Handle profile picture upload
+                # profile_picture_file = request.files.get('profile_picture')
+                # profile_picture_name = 'default.png'  # Default profile picture
+
+                profile_blob = None
+                profile_mime = None
+                # profile_picture_file = request.files.get('profile_picture')
+                pic = request.files.get('profile_picture')
+                if pic and pic.filename:
+                    profile_blob = pic.read()
+                    profile_mime = pic.mimetype
+                # if profile_picture_file and profile_picture_file.filename != '':
+                #     saved_pic = save_profile_picture(profile_picture_file, email)
+                #     if saved_pic:
+                #         profile_picture_name = saved_pic
+
+                # Insert user with profile picture
                 cursor.execute("""
-                    INSERT INTO Users (name, email, password)
-                    VALUES (?, ?, ?)
-                """, name, email, generate_password_hash(password))
+                    INSERT INTO Users (name, email, password, profile_picture, profile_picture_mime)
+                    VALUES (?, ?, ?, ?, ?)
+                """, name, email, generate_password_hash(password), profile_blob, profile_mime)
 
                 conn.commit()
 
@@ -300,23 +368,124 @@ def register():
 def logout():
     session.clear()
     return redirect(url_for('login'))
-
 @app.route('/profile')
 @login_required
 def profile():
     user = get_current_user()
+
     profile_picture_url = None
-    if user and user.get('profile_picture'):
+    if user:
         profile_picture_url = url_for(
-            'static', filename=f"{PROFILE_PIC_URL_PREFIX}/{user['profile_picture']}"
+            'get_profile_picture',
+            user_id=user['user_id']
         )
-    return render_template('profile.html', user=user, profile_picture_url=profile_picture_url)
+
+    return render_template(
+        'profile.html',
+        user=user,
+        profile_picture_url=profile_picture_url
+    )
 
 
-@app.route('/uploads/<path:filename>')
+# @app.route('/profile')
+# @login_required
+# def profile():
+#     user = get_current_user()
+#     profile_picture_url = None
+#     if user and user.get('profile_picture'):
+#         profile_picture_url = ameurl_for(
+#             'static', filename=f"{PROFILE_PIC_URL_PREFIX}/{user['profile_picture']}"
+#         )
+#     return render_template('profile.html', user=user, profile_picture_url=profile_picture_url)
+
+@app.route('/update_profile_picture', methods=['POST'])
 @login_required
-def get_uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+def update_profile_picture():
+    """Update user's profile picture in database"""
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'User session expired'}), 401
+
+        if 'profile_picture' not in request.files:
+            return jsonify({'error': 'No profile picture provided'}), 400
+
+        profile_picture_file = request.files['profile_picture']
+        if profile_picture_file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Get user email for filename
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("SELECT email FROM Users WHERE user_id = ?", user_id)
+            user_row = cursor.fetchone()
+            if not user_row:
+                conn.close()
+                return jsonify({'error': 'User not found'}), 404
+            
+            user_email = user_row[0]
+
+            # Save the new profile picture
+            saved_pic = save_profile_picture(profile_picture_file, user_email)
+            if not saved_pic:
+                conn.close()
+                return jsonify({'error': 'Failed to save profile picture'}), 500
+
+            # Update database with new profile picture path
+            cursor.execute("""
+                UPDATE Users 
+                SET profile_picture = ? 
+                WHERE user_id = ?
+            """, saved_pic, user_id)
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({
+                'success': True,
+                'message': 'Profile picture updated successfully',
+                'profile_picture': saved_pic
+            })
+        except Exception as db_error:
+            conn.rollback()
+            conn.close()
+            print(f"Database error updating profile picture: {str(db_error)}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+    except Exception as e:
+        print(f"Error updating profile picture: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to update profile picture: {str(e)}'}), 500
+
+
+@app.route('/download/<int:file_id>')
+@login_required
+def download_file(file_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_blob, file_name, file_mime
+        FROM Files
+        WHERE file_id = ?
+    """, file_id)
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return "File not found", 404
+
+    return Response(
+        row[0],
+        mimetype=row[2],
+        headers={
+            "Content-Disposition": f"attachment; filename={row[1]}"
+        }
+    )
+
 
 # Email configuration
 SMTP_SERVER = "smtp.gmail.com"
@@ -602,36 +771,290 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 @login_required
-def upload_document():
-    if 'document' not in request.files:
-        return jsonify({'error': 'No document uploaded'}), 400
+def upload():
+    user = get_current_user()
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    file = request.files['document']
-    if not allowed_document(file.filename):
-        return jsonify({'error': 'Invalid file type'}), 400
+    qr_codes = []
+    # ---------- file or link ----------
+    file_url = None
+    try:
+        file = request.files.get('document', None)
+        fileLink = request.form.get('fileLink', '').strip()
 
-    filename = secure_filename(file.filename)
-    path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(path)
+        file_bytes = None
+        file_name = None
+        file_mime = None
+        file_url = None
 
-    file_link = url_for('get_uploaded_file', filename=filename, _external=True)
+        if file and file.filename:
+            file_bytes = file.read()
+            file_name = file.filename
+            file_mime = file.mimetype
+        elif fileLink != "":
+            file_url = fileLink
+        else:
+            return jsonify({"error": "No file or link provided"}), 400
+        uploaded_by = session.get('user_id')
+        if not uploaded_by:
+            return jsonify({'error': 'User session expired. Please login again.'}), 401
 
-    key = Fernet.generate_key()
-    encrypted_link = Fernet(key).encrypt(file_link.encode())
+        file_bytes = file.read()
+        # ---------- expiration ----------
+        upload_timestamp = datetime.now()
+        expiration_hours = float(request.form.get('expiration_hours', 24))
+        expiration_timestamp = datetime.now() + timedelta(hours=expiration_hours)
 
-    qr_data = {
-        'key': key.decode(),
-        'encrypted_link': encrypted_link.decode(),
-        'email': session['user_email'],
-        'expiry': time.time() + 86400
-    }
 
-    qr = qrcode.make(json.dumps(qr_data))
-    qr_name = f"qr_{int(time.time())}.png"
-    qr_path = os.path.join(UPLOAD_FOLDER, qr_name)
-    qr.save(qr_path)
+        # ---------- save file ----------
+        cursor.execute("""
+            INSERT INTO Files (uploaded_by, file_blob, file_name, file_mime,
+                upload_timestamp, expiration_timestamp)
+            OUTPUT INSERTED.file_id
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user['user_id'],
+            file_bytes,
+            file.filename,
+            file.mimetype,
+            upload_timestamp,
+            expiration_timestamp
+        ))
 
-    return jsonify({'qr': url_for('get_uploaded_file', filename=qr_name)})
+        file_id = cursor.fetchone()[0]
+        # ---------- AES-256 encryption ----------
+        aes_key = get_random_bytes(32)   # 256 bits
+        iv = get_random_bytes(16)
+
+        cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+        plaintext = str(file_id).encode()
+        padded = pad(plaintext, AES.block_size)
+        encrypted = cipher.encrypt(padded)
+        ct_bytes = cipher.encrypt(pad(str(file_id).encode(), AES.block_size))
+
+        qr_payload = {
+            "ciphertext": base64.b64encode(ct_bytes).decode(),
+            "iv": base64.b64encode(cipher.iv).decode(),
+            "key": base64.b64encode(aes_key).decode(),
+            "expiry": expiration_timestamp.isoformat()
+        }
+
+        payload_json = json.dumps(qr_payload)
+   # ---------- generate QR ----------
+        qr_img = qrcode.make(payload_json)
+        buffer = io.BytesIO()
+        qr_img.save(buffer, format="PNG")
+        qr_bytes = buffer.getvalue()
+
+        # ---------- save QR ----------
+        cursor.execute("""
+            INSERT INTO QRCode (
+                file_id, encrypted_payload, qr_image, qr_timestamp
+            )
+            OUTPUT INSERTED.qr_id
+            VALUES (?, ?, ?, ?)
+        """, (
+            file_id,
+            payload_json,
+            qr_bytes,
+            datetime.utcnow()
+        ))
+
+        qr_id = cursor.fetchone()[0]
+        conn.commit()
+
+        return jsonify({
+            "success": True,
+            "qr_id": qr_id
+        })
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        conn.close()
+    #     try:
+    #         # Collect all receiver photos and emails
+    #         photos = []
+    #         emails = []
+    #         index = 0
+            
+    #         while f'photo_{index}' in request.files:
+    #             photo = request.files[f'photo_{index}']
+    #             if photo and photo.filename != '':
+    #                 photos.append(photo)
+    #             index += 1
+            
+    #         index = 0
+    #         while f'email_{index}' in request.form:
+    #             email = request.form.get(f'email_{index}', '').strip().lower()
+    #             if email:
+    #                 emails.append(email)
+    #             index += 1
+            
+    #         if not photos or not emails:
+    #             conn.close()
+    #             return jsonify({'error': 'At least one receiver with photo and email is required'}), 400
+            
+    #         if len(photos) != len(emails):
+    #             conn.close()
+    #             return jsonify({'error': 'Number of photos and emails must match'}), 400
+
+    #         # Determine file source: direct upload or link
+    #         file_link = None
+    #         unique_filename = None
+    #         path = None
+            
+    #         if 'document' in request.files and request.files['document'].filename != '':
+    #             # User uploaded a file directly
+    #             file = request.files['document']
+    #             file_bytes = file.read()
+    #             if not allowed_document(file.filename):
+    #                 conn.close()
+    #                 return jsonify({'error': 'Invalid file type. Only PDF and DOCX files are allowed.'}), 400
+                
+    #             filename = secure_filename(file.filename)
+    #             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    #             unique_filename = f"{timestamp}_{filename}"
+    #             path = os.path.join(UPLOAD_FOLDER, unique_filename)
+                
+    #             file_bytes = file.read()
+    #             mime_type = file.mimetype
+    #             original_name = file.filename
+    #             file = request.files['document']
+    #             file_bytes = file.read()
+
+    #             cursor.execute("""
+    #                 INSERT INTO File (file_blob, file_name, file_mime, uploaded_by, upload_timestamp)
+    #                 OUTPUT INSERTED.file_id
+    #                 VALUES (?, ?, ?, ?, ?)
+    #             """, file_bytes, file.filename, file.mimetype, uploaded_by, datetime.now())
+
+    #             file_id = cursor.fetchone()[0]
+
+
+    #             file_link = url_for('get_uploaded_file', filename=unique_filename, _external=True)
+    #         else:
+    #             # User provided a file link
+    #             file_link = request.form.get('fileLink', '').strip()
+    #             if not file_link:
+    #                 conn.close()
+    #                 return jsonify({'error': 'Please provide either a document file or a file link'}), 400
+
+    #         # Get expiration time from form (in hours, default to 24 hours)
+    #         expiration_hours = request.form.get('expiration_hours', '24')
+    #         try:
+    #             expiration_hours = float(expiration_hours)
+    #             if expiration_hours <= 0:
+    #                 expiration_hours = 24
+    #         except (ValueError, TypeError):
+    #             expiration_hours = 24
+            
+    #         expiration_timestamp = time.time() + (expiration_hours * 3600)
+
+    #         # Process each receiver and generate QR codes
+    #         qr_urls = []
+    #         upload_timestamp = datetime.now()
+            
+    #         for i, (photo, email) in enumerate(zip(photos, emails)):
+    #             # Look up recipient by email
+    #             cursor.execute("SELECT user_id FROM Users WHERE email = ?", email)
+    #             recipient_row = cursor.fetchone()
+    #             if not recipient_row:
+    #                 conn.close()
+    #                 return jsonify({'error': f'Recipient {email} not found. They must register first.'}), 400
+    #             recipient_id = recipient_row[0]
+
+    #             # Save the photo (for face recognition later)
+    #             photo_filename = secure_filename(f"{email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.jpg")
+    #             file = request.files['document']
+    #             file_bytes = file.read()
+
+    #             cursor.execute("""
+    #                 INSERT INTO File (file_blob, file_name, file_mime, uploaded_by, upload_timestamp)
+    #                 OUTPUT INSERTED.file_id
+    #                 VALUES (?, ?, ?, ?, ?)
+    #             """, file_bytes, file.filename, file.mimetype, uploaded_by, datetime.now())
+
+    #             file_id = cursor.fetchone()[0]
+
+
+    #             # Generate encryption key for this receiver
+    #             key = Fernet.generate_key()
+    #             f = Fernet(key)
+    #             encrypted_link = f.encrypt(file_link.encode())
+
+    #             encryption_file_path = path if path else file_link
+    #             encryption_key = key.decode()
+
+    #             # Insert into File table
+    #             cursor.execute("""
+    #                 INSERT INTO File (uploaded_by, recipient_id, url, encryption_file_path, encryption_key, upload_timestamp)
+    #                 OUTPUT INSERTED.file_id
+    #                 VALUES (?, ?, ?, ?, ?, ?)
+    #             """, uploaded_by, recipient_id, file_link, encryption_file_path, encryption_key, upload_timestamp)
+                
+    #             file_id = cursor.fetchone()[0]
+
+    #             # Generate QR code
+    #             qr_data = {
+    #                 'key': encryption_key,
+    #                 'encrypted_link': encrypted_link.decode(),
+    #                 'email': email,
+    #                 'expiry': expiration_timestamp,
+    #                 'file_id': file_id
+    #             }
+
+    #             qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    #             qr.add_data(json.dumps(qr_data))
+    #             qr.make(fit=True)
+    #             qr_image = qr.make_image(fill_color="black", back_color="white")
+                
+    #             qr_name = f"qr_{email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.png"
+    #             qr_path = os.path.join(UPLOAD_FOLDER, qr_name)
+    #             qr_image.save(qr_path)
+
+    #             # Insert into QRCode table
+    #             qr_metadata = json.dumps({
+    #                 'recipient_email': email,
+    #                 'expiry': expiration_timestamp,
+    #                 'expiration_hours': expiration_hours
+    #             })
+    #             qr_timestamp = datetime.now()
+                
+    #             cursor.execute("""
+    #                 INSERT INTO QRCode (file_id, qr_image_path, qr_metadata, qr_timestamp)
+    #                 VALUES (?, ?, ?, ?)
+    #             """, file_id, qr_path, qr_metadata, qr_timestamp)
+
+    #             qr_url = url_for('get_uploaded_file', filename=qr_name)
+    #             qr_urls.append({
+    #                 'email': email,
+    #                 'qr_path': qr_url
+    #             })
+
+    #         conn.commit()
+    #         conn.close()
+
+    #         return jsonify({
+    #             'success': True,
+    #             'message': f'Document processed, {len(qr_urls)} QR code(s) generated and saved to database',
+    #             'qr_codes': qr_urls
+    #         })
+    #     except Exception as db_error:
+    #         conn.rollback()
+    #         conn.close()
+    #         print(f"Database error in upload_document: {str(db_error)}")
+    #         import traceback
+    #         traceback.print_exc()
+    #         return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+    # except Exception as e:
+    #     print(f"Error in upload_document: {str(e)}")
+    #     import traceback
+    #     traceback.print_exc()
+    #     return jsonify({'error': f'Upload failed: {str(e)}'}), 500
     # # Collect all receiver photos and emails
     # photos = []
     # emails = []
@@ -772,18 +1195,40 @@ def upload_document():
     #     'message': f'Document processed, {len(qr_urls)} QR code(s) generated',
     #     'qr_codes': qr_urls
     # })
+    
+@app.route('/qr/<int:qr_id>')
+@login_required
+def get_qr(qr_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT qr_image
+        FROM QRCode
+        WHERE qr_id = ?
+    """, qr_id)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return "QR not found", 404
+
+    return Response(row[0], mimetype="image/png")
+
 @app.route('/scan', methods=['POST'])
 @login_required
 def scan_qr():
-    file = request.files.get('file')
-    if not file:
-        return jsonify({'error': 'No QR image'}), 400
-
-    path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
-    file.save(path)
-
-    img = cv2.imread(path)
+    img = cv2.imread(request.files['file'])
     decoded = decode(img)
+    # if not file:
+    #     return jsonify({'error': 'No QR image'}), 400
+
+    # path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
+    # file.save(path)
+
+    # img = cv2.imread(path)
+    # decoded = decode(img)
 
     if not decoded:
         return jsonify({'error': 'Invalid QR'}), 400
@@ -859,7 +1304,7 @@ def scan_qr():
 def verify_face():
     user_id = session['user_id']
 
-    result, confidence = face_recognition_pipeline(user_id)
+    result, _ = face_recognition_pipeline(user_id)
 
     if result != "Match":
         return jsonify({'error': 'Face verification failed'}), 400
@@ -971,9 +1416,23 @@ def verify_otp():
 
     qr = session['qr_data']
     f = Fernet(qr['key'].encode())
-    link = f.decrypt(qr['encrypted_link'].encode()).decode()
+    file_id = int(f.decrypt(qr['encrypted_file_id'].encode()).decode())
 
-    return jsonify({'success': True, 'file_link': link})
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_blob, file_name, file_mime
+        FROM Files WHERE file_id = ?
+    """, file_id)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return Response(
+        row[0],
+        mimetype=row[2],
+        headers={"Content-Disposition": f"attachment; filename={row[1]}"}
+    )
     # user_otp = request.form['otp']
 
     # if 'otp' not in session:

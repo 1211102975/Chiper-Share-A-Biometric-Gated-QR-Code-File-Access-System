@@ -630,7 +630,7 @@
                             qrCard.innerHTML = `
                                 <h6 class="mb-2"><i class="bi bi-person"></i> Receiver ${index + 1}: ${qrData.email}</h6>
                                 <div style="text-align: center; margin-bottom: 10px;">
-                                    <img src="${qrData.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 250px;">
+                                    <img src="/qr/${qrData.qr_id}" class="img-fluid"  alt="QR Code" style="max-width: 250px;">
                                 </div>
                                 <div style="text-align: center;">
                                     <button class="btn btn-success download-qr-btn" data-qr-path="${qrData.qr_path}" data-email="${qrData.email}">
@@ -665,7 +665,7 @@
                         // Fallback for single QR code (backward compatibility)
                         qrCodesContainer.innerHTML = `
                             <div style="text-align: center;">
-                                <img src="${data.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 300px;">
+                                <img src="/qr/${qrData.qr_id}" class="img-fluid"  alt="QR Code" style="max-width: 300px;">
                             </div>
                             <div class="mt-3" style="text-align: center;">
                                 <button class="btn btn-success" onclick="downloadQR('${data.qr_path}')">
