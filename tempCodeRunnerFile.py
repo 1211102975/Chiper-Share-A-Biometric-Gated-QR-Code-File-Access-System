@@ -1,1 +1,1 @@
-ot o
+/send_otp
