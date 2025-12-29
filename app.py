@@ -38,6 +38,8 @@ from db import get_db_connection
 from face_verifier import face_recognition_pipeline
 import base64
 import io
+import requests
+from urllib.parse import urlparse
 
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
@@ -81,7 +83,7 @@ def get_current_user():
 
     cursor.execute("""
         SELECT user_id, name, email,
-               COALESCE(profile_pic_path, 'profile_pics/default.png')
+               COALESCE(profile_pic_path, 'profile_pics/default.jpg')
         FROM Users
         WHERE user_id = ?
     """, user_id)
@@ -156,7 +158,7 @@ def dashboard():
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT user_id, name, email, COALESCE(profile_pic_path, 'default.png')
+            SELECT user_id, name, email, COALESCE(profile_pic_path, 'default.jpg')
             FROM Users
             WHERE user_id = ?
         """, user_id)
@@ -169,7 +171,7 @@ def dashboard():
                 'user_id': row[0],
                 'name': row[1],
                 'email': row[2],
-                'profile_pic_path': row[3] if row[3] else 'default.png'
+                'profile_pic_path': row[3] if row[3] else 'default.jpg'
             }
 
     return render_template('index.html', user=user)
@@ -284,7 +286,7 @@ def register():
                     pic.save(save_path)
                     pic_path = f"profile_pics/{filename}"
                 else:
-                    pic_path = "profile_pics/default.png"
+                    pic_path = "profile_pics/default.jpg"
 
                 # Insert user
                 cursor.execute("""
@@ -310,10 +312,12 @@ def register():
 
 
 @app.route('/logout')
-@login_required
 def logout():
+    session.pop('user_id', None)
+    session.pop('user_email', None)
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
+
 @app.route('/profile')
 @login_required
 def profile():
@@ -425,7 +429,7 @@ def update_profile():
                 
                 # Get updated user data
                 cursor.execute("""
-                    SELECT user_id, name, email, COALESCE(profile_pic_path, 'profile_pics/default.png')
+                    SELECT user_id, name, email, COALESCE(profile_pic_path, 'profile_pics/default.jpg')
                     FROM Users WHERE user_id = ?
                 """, user_id)
                 updated_row = cursor.fetchone()
@@ -634,9 +638,21 @@ def upload():
             original_name = secure_filename(file.filename)
             file_bytes = file.read()
             mime_type = file.mimetype
+            file_source = "upload"
+
         elif fileLink:
-            # Download into memory? (optional)
-            return jsonify({"error": "URL uploads not implemented in encrypted mode"}), 400
+            try:
+                r = requests.get(fileLink, timeout=10)
+                if r.status_code != 200:
+                    return jsonify({"error": "Failed to download file from URL"}), 400
+                
+                file_bytes = r.content
+                original_name = fileLink.split("/")[-1]
+                mime_type = "application/octet-stream"
+                file_source = "url"
+
+            except Exception as e:
+                return jsonify({"error": "Invalid or unreachable URL"}), 400
         else:
             return jsonify({"error": "No file provided"}), 400
 
@@ -673,16 +689,19 @@ def upload():
         expiration_timestamp = datetime.now() + timedelta(hours=expiration_hours)
 
         cursor.execute("""
-            INSERT INTO Files (uploaded_by, file_path, file_name, file_mime, expiration_timestamp)
+            INSERT INTO Files (uploaded_by, file_path, file_name, file_mime, expiration_timestamp, file_url, file_source)
             OUTPUT INSERTED.file_id
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             user['user_id'],
-            stored_path,
+            stored_path,  # Always set file_path since encrypted file is saved to disk for both upload and URL sources
             original_name,
             mime_type,
-            expiration_timestamp
+            expiration_timestamp,
+            fileLink if file_source == "url" else None,
+            file_source
         ))
+
 
         file_id = cursor.fetchone()[0]
 
@@ -860,7 +879,6 @@ def scan_qr():
 # =========================
 @app.route('/verify_face_stream', methods=['POST'])
 def verify_face_stream():
-    print("\n===== VERIFY FACE STREAM CALLED =====")
 
     qr = session.get("qr_data")
     if not qr:
@@ -902,8 +920,6 @@ def verify_face_stream():
     if dist > 0.6:
         return jsonify({"match": False}), 200
 
-    print("✅ FACE MATCH SUCCESS!")
-
     # ------------------------------
     # 🔥 FIX: Use database lock to prevent duplicate OTP (race condition fix)
     # ------------------------------
@@ -924,7 +940,6 @@ def verify_face_stream():
                 
                 if existing and existing[2] == "Sent":
                     conn.close()
-                    print("⚠ OTP already sent earlier, reusing existing OTP")
                     return jsonify({"success": True, "otp_sent": True}), 200
 
         # Check database for existing unverified OTP with UPDLOCK to prevent race conditions
@@ -942,7 +957,6 @@ def verify_face_stream():
         if existing_record:
             # Reuse existing OTP if it's still valid (not verified)
             log_id, otp, otp_status, otp_created_at = existing_record
-            print(f"⚠ Found existing OTP in database, reusing: {otp}")
             
             # Don't send email again if OTP was recently created (within last 5 minutes)
             should_send_email = True
@@ -953,7 +967,6 @@ def verify_face_stream():
                         otp_created_at = datetime.fromisoformat(otp_created_at.replace('Z', '+00:00'))
                     time_diff = (datetime.now() - otp_created_at).total_seconds()
                     if time_diff < 300:  # Don't resend if sent within last 5 minutes
-                        print("⚠ OTP was sent recently, skipping duplicate email")
                         should_send_email = False
                 except Exception as e:
                     print(f"Error checking OTP timestamp: {e}")
@@ -1079,7 +1092,65 @@ def verify_otp():
             WHERE log_id=?
         """, log_id)
         conn.commit()
+
+        # -------------------------------
+        # 🔥 NEW FEATURE: Notify sender
+        # -------------------------------
+
+        # 1. Get access timestamp + receiver email + file name + sender ID
+        cursor.execute("""
+            SELECT A.access_time, A.receiver_email, F.file_name, F.uploaded_by
+            FROM AccessLog A
+            JOIN Files F ON A.file_id = F.file_id
+            WHERE A.log_id = ?
+        """, (log_id,))
+        access_info = cursor.fetchone()
+
+        if access_info:
+            access_time, receiver_email, file_name, sender_id = access_info
+
+            # 2. Fetch sender's email
+            cursor.execute("SELECT email FROM Users WHERE user_id=?", (sender_id,))
+            sender_row = cursor.fetchone()
+
+            if sender_row:
+                sender_email = sender_row[0]
+
+                # 3. Send email to sender
+                try:
+                    msg = MIMEMultipart()
+                    msg["From"] = SENDER_EMAIL
+                    msg["To"] = sender_email
+                    msg["Subject"] = "Your Secure File Was Accessed"
+
+                    body = f"""
+                Hello,
+
+                Your shared file has been accessed.
+
+                📄 File: {file_name}
+                👤 Receiver: {receiver_email}
+                ⏳ Accessed At: {access_time}
+
+                If this was not expected, please review your security settings immediately.
+
+                This is an automated notification.
+                """
+                    msg.attach(MIMEText(body.strip(), "plain"))
+
+                    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+                    server.starttls()
+                    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                    server.send_message(msg)
+                    server.quit()
+
+                    print(f"📧 Sender notified at {sender_email}")
+
+                except Exception as e:
+                    print("⚠ Error sending access notification email:", e)
+
         conn.close()
+
 
         session["verified_file_id"] = file_id
 
@@ -1123,11 +1194,17 @@ def download_secure_file():
             return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
 
         # 1. Fetch file path and original filename
-        cursor.execute("SELECT file_path, file_name FROM Files WHERE file_id=?", (file_id,))
+        cursor.execute("""
+            SELECT file_path, file_name, file_url, file_source 
+            FROM Files WHERE file_id=?
+        """, (file_id,))
+
         row = cursor.fetchone()
         if not row:
             conn.close()
             return jsonify({"error": "File not found"}), 404
+
+        file_path, original_filename, file_url, file_source = row
 
         relative_path, original_filename = row[0], row[1]
 
@@ -1185,6 +1262,18 @@ def download_secure_file():
             return jsonify({"error": "Invalid IV size"}), 500
 
         # 3. Load encrypted file from disk
+        # If file is URL type → return immediately (no decryption)
+        if file_source == "url":
+            r = requests.get(file_url)
+            if r.status_code != 200:
+                return jsonify({"error": "Cannot download file from URL"}), 500
+
+            return Response(
+                r.content,
+                headers={"Content-Disposition": f"attachment; filename={original_filename}"},
+                mimetype="application/octet-stream"
+            )
+        
         abs_path = os.path.join(BASE_DIR, os.path.normpath(relative_path))
         
         if not os.path.exists(abs_path):
@@ -1205,6 +1294,7 @@ def download_secure_file():
             return jsonify({"error": "Invalid tag size"}), 500
 
         # 5. Decrypt AES-GCM
+
         try:
             print(f"Decrypting: key_len={len(aes_key)}, iv_len={len(iv)}, ciphertext_len={len(ciphertext)}, tag_len={len(file_tag)}")
             cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)

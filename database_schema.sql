@@ -22,6 +22,8 @@ CREATE TABLE Files (
     file_mime VARCHAR(100) NULL,
     upload_timestamp DATETIME DEFAULT GETDATE(),
     expiration_timestamp DATETIME NOT NULL,
+    file_url NVARCHAR(MAX) NULL,
+    file_source VARCHAR(10) DEFAULT 'upload',
 
     CONSTRAINT fk_file_user FOREIGN KEY (uploaded_by)
         REFERENCES Users(user_id)
