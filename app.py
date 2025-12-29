@@ -64,8 +64,8 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "cyloixy2610@gmail.com"
-SENDER_PASSWORD = "gprb gqku lqdf iemg"   # Gmail App Password
+SENDER_EMAIL = "securedoc6@gmail.com"
+SENDER_PASSWORD = "cwmb ljuj mzfa knpu"   # Gmail App Password
 
 def generate_otp():
     return str(random.randint(100000, 999999))
@@ -104,6 +104,9 @@ def login_required(f):
     @wraps(f)
     def wrap(*args, **kwargs):
         if 'user_id' not in session:
+            # Check if it's an AJAX request
+            if request.is_json or request.headers.get('Content-Type') == 'application/json' or request.method == 'POST':
+                return jsonify({'error': 'Authentication required. Please login.', 'redirect': url_for('login')}), 401
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return wrap
@@ -139,37 +142,35 @@ def save_profile_picture(file, email):
 
 @app.route('/')
 def home():
-    if 'user_email' in session:
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
 
 
 @app.route('/dashboard')
-@login_required
 def dashboard():
-    user_id = session['user_id']
+    # Check if user is logged in
+    user_id = session.get('user_id')
+    user = None
+    
+    if user_id:
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, name, email, COALESCE(profile_pic_path, 'default.png')
+            FROM Users
+            WHERE user_id = ?
+        """, user_id)
 
-    cursor.execute("""
-        SELECT user_id, name, email, COALESCE(profile_pic_path, 'default.png')
-        FROM Users
-        WHERE user_id = ?
-    """, user_id)
+        row = cursor.fetchone()
+        conn.close()
 
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        return redirect(url_for('logout'))
-
-    user = {
-        'user_id': row[0],
-        'name': row[1],
-        'email': row[2],
-        'profile_pic_path': row[3] if row[3] else 'default.png'
-    }
+        if row:
+            user = {
+                'user_id': row[0],
+                'name': row[1],
+                'email': row[2],
+                'profile_pic_path': row[3] if row[3] else 'default.png'
+            }
 
     return render_template('index.html', user=user)
 
@@ -332,6 +333,132 @@ def profile():
     )
 
 
+@app.route('/update_profile', methods=['POST'])
+@login_required
+def update_profile():
+    """Update user's profile information"""
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'User session expired'}), 401
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get current user data
+            cursor.execute("SELECT email FROM Users WHERE user_id = ?", user_id)
+            user_row = cursor.fetchone()
+            if not user_row:
+                conn.close()
+                return jsonify({'error': 'User not found'}), 404
+            
+            user_email = user_row[0]
+            updates = []
+            params = []
+
+            # Update name if provided
+            if 'name' in request.form and request.form['name'].strip():
+                new_name = request.form['name'].strip()
+                if len(new_name) < 2:
+                    conn.close()
+                    return jsonify({'error': 'Name must be at least 2 characters'}), 400
+                updates.append("name = ?")
+                params.append(new_name)
+
+            # Update email if provided
+            if 'email' in request.form and request.form['email'].strip():
+                new_email = request.form['email'].strip().lower()
+                if '@' not in new_email:
+                    conn.close()
+                    return jsonify({'error': 'Invalid email format'}), 400
+                
+                # Check if email is already taken by another user
+                cursor.execute("SELECT user_id FROM Users WHERE email = ? AND user_id != ?", (new_email, user_id))
+                if cursor.fetchone():
+                    conn.close()
+                    return jsonify({'error': 'Email already in use'}), 400
+                
+                updates.append("email = ?")
+                params.append(new_email)
+
+            # Update password if provided
+            if 'password' in request.form and request.form['password']:
+                new_password = request.form['password']
+                if len(new_password) < 6:
+                    conn.close()
+                    return jsonify({'error': 'Password must be at least 6 characters'}), 400
+                
+                # Verify current password if provided
+                if 'current_password' in request.form and request.form['current_password']:
+                    cursor.execute("SELECT password_hash FROM Users WHERE user_id = ?", user_id)
+                    current_hash = cursor.fetchone()[0]
+                    if not check_password_hash(current_hash, request.form['current_password']):
+                        conn.close()
+                        return jsonify({'error': 'Current password is incorrect'}), 400
+                
+                hashed_password = generate_password_hash(new_password)
+                updates.append("password_hash = ?")
+                params.append(hashed_password)
+
+            # Update profile picture if provided
+            if 'profile_picture' in request.files:
+                profile_picture_file = request.files['profile_picture']
+                if profile_picture_file.filename != '':
+                    stored_name = save_profile_picture(profile_picture_file, user_email)
+                    if stored_name:
+                        # Save the file to disk
+                        save_path = os.path.join("static/profile_pics", stored_name)
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                        profile_picture_file.seek(0)  # Reset file pointer
+                        profile_picture_file.save(save_path)
+                        
+                        updates.append("profile_pic_path = ?")
+                        params.append(f"profile_pics/{stored_name}")
+
+            # Execute update if there are any changes
+            if updates:
+                params.append(user_id)
+                update_query = f"UPDATE Users SET {', '.join(updates)} WHERE user_id = ?"
+                cursor.execute(update_query, params)
+                conn.commit()
+                
+                # Get updated user data
+                cursor.execute("""
+                    SELECT user_id, name, email, COALESCE(profile_pic_path, 'profile_pics/default.png')
+                    FROM Users WHERE user_id = ?
+                """, user_id)
+                updated_row = cursor.fetchone()
+                conn.close()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Profile updated successfully',
+                    'user': {
+                        'user_id': updated_row[0],
+                        'name': updated_row[1],
+                        'email': updated_row[2],
+                        'profile_pic_path': updated_row[3]
+                    }
+                })
+            else:
+                conn.close()
+                return jsonify({'error': 'No changes provided'}), 400
+                
+        except Exception as db_error:
+            conn.rollback()
+            conn.close()
+            print(f"Database error updating profile: {str(db_error)}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+    except Exception as e:
+        print(f"Error updating profile: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to update profile: {str(e)}'}), 500
+
+
 @app.route('/update_profile_picture', methods=['POST'])
 @login_required
 def update_profile_picture():
@@ -397,7 +524,6 @@ def update_profile_picture():
 
 
 @app.route('/download/<int:file_id>')
-@login_required
 def download_file(file_id):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -424,8 +550,8 @@ def download_file(file_id):
 # Email configuration
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "cyloixy2610@gmail.com"  # Your Gmail address
-SENDER_PASSWORD = "gprb gqku lqdf iemg"  # Your Gmail App Password
+SENDER_EMAIL = "securedoc6@gmail.com"  # Your Gmail address
+SENDER_PASSWORD = "cwmb ljuj mzfa knpu"  # Your Gmail App Password
 
 # Initialize Mediapipe Face Detection
 mp_face_detection = mp.solutions.face_detection
@@ -521,7 +647,10 @@ def upload():
         iv = get_random_bytes(12)
 
         cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
-        encrypted_file, tag = cipher.encrypt_and_digest(file_bytes)
+        ciphertext, tag = cipher.encrypt_and_digest(file_bytes)
+
+        # Store ciphertext + tag together
+        encrypted_blob = ciphertext + tag
 
         # -----------------------------
         # 3. Save encrypted file to disk
@@ -531,8 +660,11 @@ def upload():
         stored_path = os.path.join("static", "uploads", stored_filename)
         abs_path = os.path.join(BASE_DIR, stored_path)
 
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
         with open(abs_path, "wb") as f:
-            f.write(encrypted_file)
+            f.write(encrypted_blob)
 
         # -----------------------------
         # 4. Insert into Files table
@@ -728,86 +860,165 @@ def scan_qr():
 # =========================
 @app.route('/verify_face_stream', methods=['POST'])
 def verify_face_stream():
+    print("\n===== VERIFY FACE STREAM CALLED =====")
+
+    qr = session.get("qr_data")
+    if not qr:
+        print("⛔ No QR session")
+        return jsonify({"error": "No active QR session"}), 400
+
+    file_id = qr["file_id"]
+    receiver_email = qr["receiver_email"]
+
+    # Get stored face encoding
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT face_encoding FROM ReceiverFace
+        WHERE file_id=? AND receiver_email=?
+    """, (file_id, receiver_email))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        print("⛔ No face encoding found")
+        return jsonify({"error": "Receiver face not found"}), 400
+
+    known_encoding = pickle.loads(row[0])
+
+    # Process incoming frame
+    frame = request.files.get("frame").read()
+    img = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    enc = face_recognition.face_encodings(rgb)
+
+    if not enc:
+        return jsonify({"error": "No face detected"}), 200
+
+    dist = np.linalg.norm(known_encoding - enc[0])
+    confidence = (1 - dist) * 100
+    print("Face distance =", dist, ", confidence =", confidence)
+
+    if dist > 0.6:
+        return jsonify({"match": False}), 200
+
+    print("✅ FACE MATCH SUCCESS!")
+
+    # ------------------------------
+    # 🔥 FIX: Use database lock to prevent duplicate OTP (race condition fix)
+    # ------------------------------
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
     try:
-        qr = session.get("qr_data")
-        if not qr:
-            return jsonify({"error": "No active QR session"}), 400
+        # First check session (quick check before DB lock)
+        if session.get("otp_sent") == True:
+            log_id = session.get("log_id")
+            if log_id:
+                cursor.execute("""
+                    SELECT log_id, otp_code, otp_status
+                    FROM AccessLog
+                    WHERE log_id = ? AND file_id = ? AND receiver_email = ?
+                """, (log_id, file_id, receiver_email))
+                existing = cursor.fetchone()
+                
+                if existing and existing[2] == "Sent":
+                    conn.close()
+                    print("⚠ OTP already sent earlier, reusing existing OTP")
+                    return jsonify({"success": True, "otp_sent": True}), 200
 
-        file_id = qr["file_id"]
-        receiver_email = qr["receiver_email"]
-
-        # Load known encoding
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Check database for existing unverified OTP with UPDLOCK to prevent race conditions
+        # UPDLOCK locks the rows until transaction commits, preventing concurrent inserts
         cursor.execute("""
-            SELECT face_encoding FROM ReceiverFace
-            WHERE file_id=? AND receiver_email=?
+            SELECT TOP 1 log_id, otp_code, otp_status, otp_created_at
+            FROM AccessLog WITH (UPDLOCK, ROWLOCK)
+            WHERE file_id = ? AND receiver_email = ? 
+            AND face_match_result = 1
+            AND otp_status = 'Sent'
+            ORDER BY access_time DESC
         """, (file_id, receiver_email))
-
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            return jsonify({"error": "Receiver face encoding not found"}), 400
-
-        known_encoding = pickle.loads(row[0])
-
-        # Process incoming frame
-        frame_bytes = request.files['frame'].read()
-        img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
-
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        enc = face_recognition.face_encodings(rgb)
-
-        if not enc:
-            return jsonify({"error": "No face detected"}), 200
-
-        distance = np.linalg.norm(known_encoding - enc[0])
-        confidence = (1 - distance) * 100
-
-        if distance > 0.6:
-            return jsonify({"match": False})
-
-        # -------------- MATCH SUCCESS ----------------
-        if not session.get("otp_sent"):
-            otp = str(random.randint(100000, 999999))
-
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO AccessLog(
-                    file_id,
-                    receiver_email,
-                    face_match_result,
-                    confidence_score,
-                    otp_code,
-                    otp_status
-                )
-                OUTPUT INSERTED.log_id
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                file_id,
-                receiver_email,
-                1,
-                confidence,
-                otp,
-                "Sent"
-            ))
-
-            log_id = cursor.fetchone()[0]
+        existing_record = cursor.fetchone()
+        
+        if existing_record:
+            # Reuse existing OTP if it's still valid (not verified)
+            log_id, otp, otp_status, otp_created_at = existing_record
+            print(f"⚠ Found existing OTP in database, reusing: {otp}")
+            
+            # Don't send email again if OTP was recently created (within last 5 minutes)
+            should_send_email = True
+            if otp_created_at is not None:
+                try:
+                    # Handle both datetime and string formats
+                    if isinstance(otp_created_at, str):
+                        otp_created_at = datetime.fromisoformat(otp_created_at.replace('Z', '+00:00'))
+                    time_diff = (datetime.now() - otp_created_at).total_seconds()
+                    if time_diff < 300:  # Don't resend if sent within last 5 minutes
+                        print("⚠ OTP was sent recently, skipping duplicate email")
+                        should_send_email = False
+                except Exception as e:
+                    print(f"Error checking OTP timestamp: {e}")
+            
             conn.commit()
             conn.close()
-
+            
+            # Update session
             session["log_id"] = log_id
             session["otp_sent"] = True
+            
+            # Send email only if needed
+            if should_send_email:
+                print("📧 Resending OTP email to:", receiver_email)
+                try:
+                    send_otp_email(receiver_email, otp)
+                    print("📧 Email sent successfully!")
+                except Exception as e:
+                    print("Email error:", e)
+            
+            return jsonify({"success": True, "otp_sent": True})
 
-            # send OTP email
+        # Generate new OTP if none exists (inside transaction to prevent duplicates)
+        otp = str(random.randint(100000, 999999))
+        print("Generated new OTP:", otp)
+
+        cursor.execute("""
+            INSERT INTO AccessLog(
+                file_id, receiver_email,
+                face_match_result, confidence_score,
+                otp_code, otp_status, otp_created_at
+            )
+            OUTPUT INSERTED.log_id
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            file_id, receiver_email,
+            1, confidence,
+            otp, "Sent", datetime.now()
+        ))
+
+        log_id = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        # Save log_id + mark OTP sent (AFTER successful commit)
+        session["log_id"] = log_id
+        session["otp_sent"] = True
+
+        print("📧 Sending email to:", receiver_email)
+        try:
             send_otp_email(receiver_email, otp)
+            print("📧 Email sent successfully!")
+        except Exception as e:
+            print("Email error:", e)
 
-        return jsonify({"success": True, "match": True})
-
+        return jsonify({"success": True, "otp_sent": True})
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        conn.rollback()
+        conn.close()
+        print(f"Error in OTP generation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Failed to generate OTP"}), 500
+
 
 
 @app.route('/send_otp', methods=['POST'])
@@ -889,64 +1100,148 @@ def download_secure_file():
             return jsonify({"error": "No QR session"}), 400
 
         file_id = qr["file_id"]
+        receiver_email = qr["receiver_email"]
+
+        # Check if OTP has been verified
+        log_id = session.get("log_id")
+        if not log_id:
+            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
 
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # 1. Get file path
-        cursor.execute("SELECT file_path FROM Files WHERE file_id=?", file_id)
+        # Verify OTP was verified for this file
+        cursor.execute("""
+            SELECT otp_status, access_result
+            FROM AccessLog
+            WHERE log_id = ? AND file_id = ? AND receiver_email = ?
+        """, (log_id, file_id, receiver_email))
+        
+        access_row = cursor.fetchone()
+        if not access_row or access_row[0] != "Verified":
+            conn.close()
+            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
+
+        # 1. Fetch file path and original filename
+        cursor.execute("SELECT file_path, file_name FROM Files WHERE file_id=?", (file_id,))
         row = cursor.fetchone()
         if not row:
             conn.close()
-            return jsonify({"error": "File metadata not found"}), 404
+            return jsonify({"error": "File not found"}), 404
 
-        relative_path = row[0]
+        relative_path, original_filename = row[0], row[1]
 
-        # 2. Get AES key material
-        cursor.execute("""
-            SELECT aes_key, iv, tag
-            FROM FileKey
-            WHERE file_id=?
-        """, file_id)
-
+        # 2. Fetch AES keys
+        cursor.execute(
+            "SELECT aes_key, iv, tag FROM FileKey WHERE file_id=?",
+            (file_id,)
+        )
         key_row = cursor.fetchone()
         conn.close()
 
         if not key_row:
-            return jsonify({"error": "Missing AES key for this file"}), 500
+            return jsonify({"error": "Missing AES key"}), 500
 
-        aes_key, iv, tag = key_row
+        aes_key, iv, tag_db = key_row  # tag_db stored but not used (tag is in file)
 
-        # 3. Load encrypted file
-        abs_path = os.path.join(BASE_DIR, relative_path.lstrip("/"))
+        # Ensure aes_key and iv are bytes (they might be stored as VARBINARY)
+        if isinstance(aes_key, bytes):
+            pass  # Already bytes
+        elif isinstance(aes_key, bytearray):
+            aes_key = bytes(aes_key)
+        else:
+            # Try to convert from string/other format
+            try:
+                if isinstance(aes_key, str):
+                    aes_key = aes_key.encode('latin-1')
+                else:
+                    aes_key = bytes(aes_key)
+            except Exception as e:
+                print(f"Error converting aes_key to bytes: {e}")
+                return jsonify({"error": "Invalid AES key format"}), 500
 
+        if isinstance(iv, bytes):
+            pass  # Already bytes
+        elif isinstance(iv, bytearray):
+            iv = bytes(iv)
+        else:
+            # Try to convert from string/other format
+            try:
+                if isinstance(iv, str):
+                    iv = iv.encode('latin-1')
+                else:
+                    iv = bytes(iv)
+            except Exception as e:
+                print(f"Error converting IV to bytes: {e}")
+                return jsonify({"error": "Invalid IV format"}), 500
+
+        # Validate key and IV sizes
+        if len(aes_key) != 32:
+            print(f"Invalid AES key length: {len(aes_key)}, expected 32")
+            return jsonify({"error": "Invalid AES key size"}), 500
+        
+        if len(iv) != 12:
+            print(f"Invalid IV length: {len(iv)}, expected 12")
+            return jsonify({"error": "Invalid IV size"}), 500
+
+        # 3. Load encrypted file from disk
+        abs_path = os.path.join(BASE_DIR, os.path.normpath(relative_path))
+        
         if not os.path.exists(abs_path):
-            return jsonify({"error": "Encrypted file missing"}), 404
+            return jsonify({"error": "Encrypted file not found on disk"}), 404
 
         with open(abs_path, "rb") as f:
-            encrypted_bytes = f.read()
+            encrypted_blob = f.read()
 
-        # 4. Decrypt AES-CBC (default)
+        # 4. Split ciphertext + tag (tag is last 16 bytes)
+        if len(encrypted_blob) < 16:
+            return jsonify({"error": "Invalid encrypted file format (too short)"}), 500
+
+        ciphertext = encrypted_blob[:-16]
+        file_tag = encrypted_blob[-16:]   # GCM tag is 16 bytes
+
+        # Validate tag size
+        if len(file_tag) != 16:
+            return jsonify({"error": "Invalid tag size"}), 500
+
+        # 5. Decrypt AES-GCM
         try:
-            cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-            decrypted = unpad(cipher.decrypt(encrypted_bytes), AES.block_size)
+            print(f"Decrypting: key_len={len(aes_key)}, iv_len={len(iv)}, ciphertext_len={len(ciphertext)}, tag_len={len(file_tag)}")
+            cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+            decrypted = cipher.decrypt_and_verify(ciphertext, file_tag)
+            print("Decryption successful!")
+        except ValueError as e:
+            print(f"Decryption error (MAC check failed): {e}")
+            print(f"Key: {aes_key[:8]}... (length: {len(aes_key)})")
+            print(f"IV: {iv[:8]}... (length: {len(iv)})")
+            print(f"Ciphertext length: {len(ciphertext)}")
+            print(f"Tag: {file_tag.hex()}")
+            return jsonify({"error": f"Decryption failed (MAC check failed): {str(e)}"}), 500
+        except Exception as e:
+            print(f"Unexpected decryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
 
-        except ValueError:
-            # Fallback for AES-GCM
-            cipher = AES.new(aes_key, AES.MODE_GCM, iv)
-            decrypted = cipher.decrypt_and_verify(encrypted_bytes, tag)
+        # 6. Return file with original filename
+        filename = original_filename if original_filename else os.path.basename(relative_path)
 
-        # 5. Send file
         return Response(
             decrypted,
-            headers={
-                "Content-Disposition": f"attachment; filename=secured_file"
-            },
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
             mimetype="application/octet-stream"
         )
 
+    except ValueError as e:
+        print(f"ValueError in download_secure: {e}")
+        return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Exception in download_secure: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, ssl_context=('cert.pem', 'key.pem')) 
