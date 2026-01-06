@@ -20,8 +20,6 @@ from email.mime.multipart import MIMEMultipart
 from werkzeug.utils import secure_filename
 from cryptography.fernet import Fernet
 import face_recognition
-
-
 import numpy as np
 from datetime import datetime, timedelta
 from pyzbar.pyzbar import decode
@@ -39,35 +37,65 @@ from face_verifier import face_recognition_pipeline
 import base64
 import io
 import requests
+import re
 from urllib.parse import urlparse
 
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
+from flask_wtf import CSRFProtect
+from flask_wtf.csrf import validate_csrf
+from wtforms.validators import ValidationError
 
 
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
+csrf = CSRFProtect(app)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER  # Set config for consistency
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['WTF_CSRF_CHECK_DEFAULT'] = True
+app.config['WTF_CSRF_METHODS'] = ['POST', 'PUT', 'PATCH', 'DELETE']
+app.config['WTF_CSRF_TIME_LIMIT'] = None
 
 PROFILE_PIC_URL_PREFIX = 'profile_pics'
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 ALLOWED_DOCUMENT_EXTENSIONS = {'pdf', 'docx'}
 QR_FOLDER = os.path.join(BASE_DIR, "static", "qr_codes")
 os.makedirs(QR_FOLDER, exist_ok=True)
-
-# Create necessary directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-# os.makedirs(USER_DATA_DIR, exist_ok=True)
 
+
+EMAIL_REGEX = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+MAX_EMAIL_LENGTH = 255
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SENDER_EMAIL = "securedoc6@gmail.com"
 SENDER_PASSWORD = "cwmb ljuj mzfa knpu"   # Gmail App Password
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,   # Already true, but explicit
+    SESSION_COOKIE_SECURE=True,     # Only send cookie over HTTPS
+    SESSION_COOKIE_SAMESITE='Lax'   # Prevent CSRF while keeping usability
+)
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' https://cdn.jsdelivr.net; "
+        "connect-src 'self' https://cdn.jsdelivr.net; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    return response
+
 
 def generate_otp():
     return str(random.randint(100000, 999999))
@@ -177,18 +205,42 @@ def dashboard():
     return render_template('index.html', user=user)
 
 
+def is_valid_email(email):
+    return re.match(EMAIL_REGEX, email) and len(email) <= 255
+
+def sanitize_input(value):
+    dangerous = ["..", "/", "\\", "%2f", "%5c"]
+    for d in dangerous:
+        if d in value.lower():
+            return None
+    return value
+
 @app.route('/login', methods=['GET', 'POST'])
+@csrf.exempt
 def login():
+    
     if request.method == 'GET':
         return render_template('login.html')
 
+    if request.method == 'POST':
+        try:
+            validate_csrf(request.form.get('csrf_token'))
+        except ValidationError:
+            return render_template("login.html", error="Invalid CSRF token"), 400
+
     # Normalize email (lowercase and strip) to match registration
-    email = request.form.get('email', '').strip().lower()
+    email = sanitize_input(request.form.get('email', '')).strip().lower()
     password = request.form.get('password', '')
 
     if not email or not password:
         return render_template('login.html', error='Email and password are required')
-
+    
+    if not is_valid_email(email):
+        return render_template("login.html", error="Invalid email format"), 400
+    
+    if not email:
+        return "Invalid characters in input", 400
+    
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -249,66 +301,80 @@ def get_profile_picture(user_id):
 @app.route('/register', methods=['GET', 'POST'])
 def register():
 
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
+        if 'user_id' in session:
+            return redirect(url_for('dashboard'))
 
-    error = None
+        error = None
 
-    if request.method == 'POST':
-        name = request.form.get('name', '').strip()
-        email = request.form.get('email', '').strip().lower()
-        password = request.form.get('password', '')
-        confirm_password = request.form.get('confirm_password', '')
+        if request.method == 'POST':
+            name = request.form.get('name', '').strip()
+            email = request.form.get('email', '').strip().lower()
+            password = request.form.get('password', '')
+            confirm_password = request.form.get('confirm_password', '')
 
-        if not name or not email or not password:
-            error = 'All fields are required'
-        elif password != confirm_password:
-            error = 'Passwords do not match'
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+            if not name or not email or not password:
+                error = 'All fields are required'
+            elif password != confirm_password:
+                error = 'Passwords do not match'
 
-            # Check if email exists
-            cursor.execute("SELECT user_id FROM Users WHERE email = ?", email)
-            if cursor.fetchone():
-                error = "An account with this email already exists"
-            else:
-                # Hash password
-                hashed = generate_password_hash(password)
+            elif len(email) > MAX_EMAIL_LENGTH:
+                return jsonify({"error": "Email too long"}), 400
+            
+            elif not is_valid_email(email):
+                error = "Invalid email format"
+                
+            if error:
+                return render_template("register.html", error=error)
+            
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
 
-                # Handle profile picture (store PATH only)
-                pic = request.files.get("profile_picture")
-                pic_path = None
-
-                if pic and pic.filename:
-                    filename = secure_filename(f"{email}_{int(time.time())}.jpg")
-                    save_path = os.path.join("static/profile_pics", filename)
-                    pic.save(save_path)
-                    pic_path = f"profile_pics/{filename}"
+                # Check if email exists
+                cursor.execute("SELECT user_id FROM Users WHERE email = ?", email)
+                if cursor.fetchone():
+                    error = "An account with this email already exists"
                 else:
-                    pic_path = "profile_pics/default.jpg"
+                    # Hash password
+                    hashed = generate_password_hash(password)
 
-                # Insert user
-                cursor.execute("""
-                    INSERT INTO Users (name, email, password_hash, profile_pic_path)
-                    VALUES (?, ?, ?, ?)
-                """, name, email, hashed, pic_path)
+                    # Handle profile picture (store PATH only)
+                    pic = request.files.get("profile_picture")
+                    pic_path = None
 
-                conn.commit()
+                    if pic and pic.filename:
+                        filename = secure_filename(f"{email}_{int(time.time())}.jpg")
+                        save_path = os.path.join("static/profile_pics", filename)
+                        pic.save(save_path)
+                        pic_path = f"profile_pics/{filename}"
+                    else:
+                        pic_path = "profile_pics/default.jpg"
 
-                cursor.execute("SELECT user_id FROM Users WHERE email=?", email)
-                user_id = cursor.fetchone()[0]
+                    # Insert user
+                    cursor.execute("""
+                        INSERT INTO Users (name, email, password_hash, profile_pic_path)
+                        VALUES (?, ?, ?, ?)
+                    """, name, email, hashed, pic_path)
 
-                session["user_id"] = user_id
-                session["user_email"] = email
+                    conn.commit()
 
-                conn.close()
+                    cursor.execute("SELECT user_id FROM Users WHERE email=?", email)
+                    user_id = cursor.fetchone()[0]
 
-                return redirect(url_for("dashboard"))
+                    session["user_id"] = user_id
+                    session["user_email"] = email
 
-            conn.close()
+                    conn.close()
 
-    return render_template("register.html", error=error)
+                    return redirect(url_for("dashboard"))
+                
+            except Exception as e:
+                if conn: 
+                    conn.rollback()
+                error="Registration failed due to invalid input"
+                return render_template("register.html", error=error)
+    
+        return render_template("register.html", error=error)
 
 
 @app.route('/logout')
@@ -719,7 +785,9 @@ def upload():
         receiver_index = 0
         receiver_results = []
 
+        print(f"🔍 Checking for receiver photos...")
         while f"photo_{receiver_index}" in request.files:
+            print(f"📸 Processing receiver {receiver_index}...")
             photo_file = request.files[f"photo_{receiver_index}"]
             receiver_email = request.form.get(f"email_{receiver_index}").strip().lower()
 
@@ -729,7 +797,11 @@ def upload():
             photo_filename = f"{receiver_email}_{timestamp}_{receiver_index}.jpg"
             photo_path_rel = f"static/receiver_faces/{photo_filename}"
             photo_path_abs = os.path.join(BASE_DIR, photo_path_rel)
+            
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(photo_path_abs), exist_ok=True)
             photo_file.save(photo_path_abs)
+            print(f"📷 Receiver photo saved to: {photo_path_abs}")
 
             # -----------------------------
             # Generate face encoding
@@ -759,17 +831,27 @@ def upload():
             }
 
             qr_json = json.dumps(qr_payload)
+            print(f"📝 Generated QR payload for {receiver_email}: {qr_json}")
 
             # -----------------------------
             # Generate QR PNG
             # -----------------------------
             qr_img = qrcode.make(qr_json)
+            print(f"🎨 QR image object created")
 
             qr_filename = f"qr_{receiver_email}_{timestamp}_{receiver_index}.png"
             qr_disk_rel = f"static/qr_codes/{qr_filename}"
             qr_disk_abs = os.path.join(BASE_DIR, qr_disk_rel)
 
-            qr_img.save(qr_disk_abs)
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(qr_disk_abs), exist_ok=True)
+            
+            try:
+                qr_img.save(qr_disk_abs)
+                print(f"✓ QR code saved to: {qr_disk_abs}")
+            except Exception as save_error:
+                print(f"✗ Error saving QR code: {save_error}")
+                raise
 
             # -----------------------------
             # Save QR metadata to DB
@@ -786,6 +868,7 @@ def upload():
             ))
 
             qr_id = cursor.fetchone()[0]
+            print(f"✅ QR code saved to database with ID: {qr_id}")
 
             receiver_results.append({
                 "email": receiver_email,
@@ -794,9 +877,12 @@ def upload():
             })
 
             receiver_index += 1
+        
+        print(f"📊 Total receivers processed: {receiver_index}")
 
 
         conn.commit()
+        print(f"💾 Database transaction committed")
 
         # Convert receiver_results → qr_codes format for frontend
         qr_codes = []
@@ -807,6 +893,7 @@ def upload():
                 "qr_path": f"/qr/{r['qr_id']}"
             })
 
+        print(f"📤 Returning {len(qr_codes)} QR code(s) to frontend")
         return jsonify({
             "success": True,
             "qr_codes": qr_codes
@@ -814,6 +901,9 @@ def upload():
 
     except Exception as e:
         conn.rollback()
+        print(f"❌ Error in upload route: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
     finally:
@@ -846,6 +936,7 @@ def get_qr(qr_id):
 
 
 @app.route('/scan', methods=['POST'])
+@csrf.exempt
 def scan_qr():
     try:
         file = request.files.get("file")
@@ -878,6 +969,7 @@ def scan_qr():
 # FACE → OTP
 # =========================
 @app.route('/verify_face_stream', methods=['POST'])
+@csrf.exempt
 def verify_face_stream():
 
     qr = session.get("qr_data")
@@ -1056,6 +1148,7 @@ def send_otp_route():
 # VERIFY OTP → DECRYPT
 # =========================
 @app.route('/verify_otp', methods=['POST'])
+@csrf.exempt
 def verify_otp():
     try:
         data = request.json

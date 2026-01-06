@@ -339,6 +339,7 @@
                         </div>
                         {% endif %}
                         <form id="uploadForm" {% if not user %}style="opacity: 0.6; pointer-events: none;"{% endif %}>
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <div class="mb-4">
                                 <label class="form-label"><i class="bi bi-file-type-pdf"></i> Choose Document Source</label>
                                 <div class="btn-group w-100" role="group">
@@ -572,6 +573,10 @@
             
             const docSource = document.querySelector('input[name="docSource"]:checked').value;
             const formData = new FormData();
+            
+            // Add CSRF token
+            const csrfToken = document.querySelector('input[name="csrf_token"]').value;
+            formData.append('csrf_token', csrfToken);
 
             if (docSource === 'file') {
                 const docFile = document.getElementById('document').files[0];

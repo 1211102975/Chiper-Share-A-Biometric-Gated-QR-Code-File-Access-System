@@ -1,1 +1,1 @@
-/send_otp
+/down
