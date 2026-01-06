@@ -1,26 +1,26 @@
-import random
 import smtplib
-from email.message import EmailMessage
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-otp =""
-for i in range(6):
-	otp += str(random.randint(0,9))
+sender_email="cyloixy2610@gmail.com"
+sender_password="gprb gqku lqdf iemg"
+reciever_email="cyloixy2610@gmail.com"
 
-print(otp)
+subject = "Test Email for OTP"
+body = "your otp is : 123456"
 
-server = smtplib.SMTP('smtp.gmail.com', 587)
-server.starttls()
+msg= MIMEMultipart()
+msg['From']= sender_email
+msg['To']=reciever_email
+msg['Subject']= subject
+msg.attach(MIMEText(body,'plain'))
 
-from_mail='cyloixy2610@gmail.com'
-server.login(from_mail,'jnzb bvae knot evss')
-to_mail=input("Enter your email:")
-
-msg=EmailMessage()
-msg['Subject']="OTP Verification"
-msg['From']=from_mail
-msg['To']=to_mail
-msg.set_content("Your OTP is:" + otp)
-
-server.send_message(msg)
-print("Email sent")
-server.quit()
+try:
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(sender_email, sender_password)
+    text = msg.as_string()
+    server.sendmail(sender_email, reciever_email, text)
+    print("Email sent successfully!")
+except Exception as e:
+    print(f"Failed to send email: {e}")

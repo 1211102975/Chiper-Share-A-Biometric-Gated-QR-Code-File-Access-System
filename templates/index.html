@@ -324,9 +324,22 @@
                 <div class="card">
                     <div class="card-header">
                         <i class="bi bi-file-earmark-arrow-up"></i> Upload Your Document
+                        {% if not user %}
+                        <span class="badge bg-warning ms-2">
+                            <i class="bi bi-exclamation-triangle"></i> Login Required
+                        </span>
+                        {% endif %}
                     </div>
                     <div class="card-body">
-                        <form id="uploadForm">
+                        {% if not user %}
+                        <div class="alert alert-warning mb-4" role="alert">
+                            <i class="bi bi-info-circle"></i> <strong>Login Required:</strong> You need to be logged in to upload documents and generate QR codes. 
+                            <a href="{{ url_for('login') }}" class="alert-link">Click here to login</a> or 
+                            <a href="{{ url_for('register') }}" class="alert-link">register a new account</a>.
+                        </div>
+                        {% endif %}
+                        <form id="uploadForm" {% if not user %}style="opacity: 0.6; pointer-events: none;"{% endif %}>
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <div class="mb-4">
                                 <label class="form-label"><i class="bi bi-file-type-pdf"></i> Choose Document Source</label>
                                 <div class="btn-group w-100" role="group">
@@ -432,13 +445,8 @@
                                 <video id="videoElement" autoplay></video>
                                 <canvas id="overlayCanvas" style="position: absolute; top: 0; left: 0;"></canvas>
                             </div>
-                            <div class="d-grid gap-2">
-                                <button class="btn btn-primary" onclick="startCamera()"><i class="bi bi-camera"></i> Start Camera</button>
-                                <button class="btn btn-danger" onclick="stopCamera()"><i class="bi bi-stop-circle"></i> Stop Camera</button>
-                                <button class="btn btn-success" onclick="captureAndVerify()"><i class="bi bi-check-lg"></i> Capture & Verify</button>
-                            </div>
                             <div id="verificationStatus" class="mt-3">
-                                <p class="text-muted"><i class="bi bi-info-circle"></i> Face verification is required to proceed</p>
+                                <p class="text-muted"><i class="bi bi-spinner"></i> Verifying your face... Keep your face in the camera frame.</p>
                             </div>
                         </div>
 
@@ -470,6 +478,7 @@
         let isVerifying = false;
         let verificationInterval = null;
         let faceVerificationComplete = false;
+        let otpRequestInProgress = false;  // Prevent multiple OTP requests
 
         // Toggle document source
         document.querySelectorAll('input[name="docSource"]').forEach(radio => {
@@ -547,11 +556,27 @@
             }
         }
 
+        // Check if user is logged in
+        const isLoggedIn = {{ 'true' if user else 'false' }};
+        
         // Upload Document
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
+            
+            // Check if user is logged in
+            if (!isLoggedIn) {
+                if (confirm('You need to be logged in to upload documents. Would you like to go to the login page?')) {
+                    window.location.href = '{{ url_for("login") }}';
+                }
+                return;
+            }
+            
             const docSource = document.querySelector('input[name="docSource"]:checked').value;
             const formData = new FormData();
+            
+            // Add CSRF token
+            const csrfToken = document.querySelector('input[name="csrf_token"]').value;
+            formData.append('csrf_token', csrfToken);
 
             if (docSource === 'file') {
                 const docFile = document.getElementById('document').files[0];
@@ -619,6 +644,19 @@
 
             try {
                 const response = await fetch('/upload', { method: 'POST', body: formData });
+                
+                // Handle authentication errors
+                if (response.status === 401 || response.status === 403) {
+                    const errorData = await response.json().catch(() => ({}));
+                    if (errorData.redirect) {
+                        window.location.href = errorData.redirect;
+                    } else {
+                        alert('You need to be logged in to upload documents. Redirecting to login page...');
+                        window.location.href = '{{ url_for("login") }}';
+                    }
+                    return;
+                }
+                
                 const data = await response.json();
 
                 if (data.success) {
@@ -634,7 +672,7 @@
                             qrCard.innerHTML = `
                                 <h6 class="mb-2"><i class="bi bi-person"></i> Receiver ${index + 1}: ${qrData.email}</h6>
                                 <div style="text-align: center; margin-bottom: 10px;">
-                                    <img src="${qrData.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 250px;">
+                                    <img src="/qr/${qrData.qr_id}" class="img-fluid"  alt="QR Code" style="max-width: 250px;">
                                 </div>
                                 <div style="text-align: center;">
                                     <button class="btn btn-success download-qr-btn" data-qr-path="${qrData.qr_path}" data-email="${qrData.email}">
@@ -669,7 +707,7 @@
                         // Fallback for single QR code (backward compatibility)
                         qrCodesContainer.innerHTML = `
                             <div style="text-align: center;">
-                                <img src="${data.qr_path}" class="img-fluid" alt="QR Code" style="max-width: 300px;">
+                                <img src="/qr/${qrData.qr_id}" class="img-fluid"  alt="QR Code" style="max-width: 300px;">
                             </div>
                             <div class="mt-3" style="text-align: center;">
                                 <button class="btn btn-success" onclick="downloadQR('${data.qr_path}')">
@@ -711,6 +749,8 @@
 
                 if (data.success) {
                     document.getElementById('faceVerification').style.display = 'block';
+                    // Auto-start camera and face verification
+                    startCamera();
                 } else {
                     // Check if QR code is expired
                     if (data.expired) {
@@ -749,54 +789,70 @@
 
         function startFaceVerification() {
             if (verificationInterval) return;
+
             isVerifying = true;
+            otpRequestInProgress = false; // reset
+
             verificationInterval = setInterval(async () => {
-                if (!isVerifying) return;
-                const video = document.getElementById('videoElement');
-                const canvas = document.createElement('canvas');
+
+                // HARD STOP CHECK — prevents looping
+                if (!isVerifying || faceVerificationComplete) {
+                    stopFaceVerification();
+                    return;
+                }
+
+                const video = document.getElementById("videoElement");
+                if (!video.videoWidth) return;
+
+                const canvas = document.createElement("canvas");
                 canvas.width = video.videoWidth;
                 canvas.height = video.videoHeight;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(video, 0, 0);
+                canvas.getContext("2d").drawImage(video, 0, 0);
 
                 canvas.toBlob(async (blob) => {
-                    if (!blob) return;
+                    if (!blob || faceVerificationComplete) return;
+
                     const formData = new FormData();
-                    formData.append('frame', blob, 'frame.jpg');
+                    formData.append("frame", blob);
 
-                    try {
-                        const response = await fetch('/verify_face_stream', { method: 'POST', body: formData });
-                        const data = await response.json();
+                    const res = await fetch("/verify_face_stream", {
+                        method: "POST",
+                        body: formData
+                    });
 
-                        if (data.error === 'Face recognition is not available on this system') {
-                            stopFaceVerification();
-                            alert('Face recognition is required on this system. Please ensure face_recognition package is installed.');
-                        } else if (data.success) {
-                            // Face verification successful
-                            faceVerificationComplete = true;
-                            stopCamera();
-                            document.getElementById('faceVerification').style.display = 'none';
-                            document.getElementById('otpVerification').style.display = 'block';
-                            document.getElementById('verificationStatus').innerHTML = '<div class="alert alert-success"><i class="bi bi-check-circle-fill"></i> Face verification successful! Now enter your OTP.</div>';
-                        }
-                    } catch (error) {}
+                    const data = await res.json();
+
+                    if (data.success && !faceVerificationComplete) {
+
+                        // MARK face verification done
+                        faceVerificationComplete = true;
+                        isVerifying = false;
+
+                        // STOP interval IMMEDIATELY
+                        stopFaceVerification();
+                        stopCamera();
+
+                        // SHOW OTP UI
+                        document.getElementById("faceVerification").style.display = "none";
+                        document.getElementById("otpVerification").style.display = "block";
+                    }
                 });
+
             }, 1000);
         }
+
 
         function stopFaceVerification() {
             isVerifying = false;
             if (verificationInterval) {
                 clearInterval(verificationInterval);
-                verificationInterval = null;
             }
+            verificationInterval = null;
         }
 
         function captureAndVerify() {
             if (faceVerificationComplete) {
                 alert('Face verification already completed. Please enter your OTP.');
-            } else {
-                alert('Waiting for face verification... Keep your face in the camera frame.');
             }
         }
 
@@ -833,10 +889,9 @@
         }
 
         function downloadDocument() {
-            if (window.downloadURL) {
-                window.open(window.downloadURL, '_blank');
-            }
+        window.open("/download_secure", "_blank");
         }
+
     </script>
 </body>
 </html>

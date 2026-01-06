@@ -6,7 +6,8 @@ from flask import (
     session,
     redirect,
     url_for,
-    send_from_directory,
+    send_file,
+    Response,
 )
 import os
 import cv2
@@ -18,16 +19,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from werkzeug.utils import secure_filename
 from cryptography.fernet import Fernet
-
-# Try to import face_recognition, but continue if not available
-try:
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError:
-    FACE_RECOGNITION_AVAILABLE = False
-
+import face_recognition
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from pyzbar.pyzbar import decode
 import mediapipe as mp
 import threading
@@ -38,75 +32,114 @@ import random
 from email.message import EmailMessage
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
+from db import get_db_connection
+from face_verifier import face_recognition_pipeline
+import base64
+import io
+import requests
+import re
+from urllib.parse import urlparse
+
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+from flask_wtf import CSRFProtect
+from flask_wtf.csrf import validate_csrf
+from wtforms.validators import ValidationError
+
+
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
+csrf = CSRFProtect(app)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
-app.config['KNOWN_FACES'] = os.path.join(BASE_DIR, 'known_faces')
-app.config['PROFILE_PIC_FOLDER'] = os.path.join(BASE_DIR, 'static', 'profile_pics')
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER  # Set config for consistency
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-USER_DATA_DIR = os.path.join(BASE_DIR, 'data')
-USER_DATA_FILE = os.path.join(USER_DATA_DIR, 'users.json')
+app.config['WTF_CSRF_CHECK_DEFAULT'] = True
+app.config['WTF_CSRF_METHODS'] = ['POST', 'PUT', 'PATCH', 'DELETE']
+app.config['WTF_CSRF_TIME_LIMIT'] = None
+
 PROFILE_PIC_URL_PREFIX = 'profile_pics'
 ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
 ALLOWED_DOCUMENT_EXTENSIONS = {'pdf', 'docx'}
-
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs(app.config['KNOWN_FACES'], exist_ok=True)
-os.makedirs(app.config['PROFILE_PIC_FOLDER'], exist_ok=True)
-os.makedirs(USER_DATA_DIR, exist_ok=True)
-
-# Initialize default user if users.json doesn't exist
-def initialize_default_user():
-    if not os.path.exists(USER_DATA_FILE):
-        from werkzeug.security import generate_password_hash
-        default_users = {
-            'cyloixy2610@gmail.com': {
-                'name': 'Cindy',
-                'email': 'cyloixy2610@gmail.com',
-                'password': generate_password_hash('password123'),
-                # Use bundled default profile picture if none uploaded
-                'profile_picture': 'default.png'
-            }
-        }
-        with open(USER_DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_users, f, indent=4)
-        print("✓ Default user account created (Cindy / cyloixy2610@gmail.com)")
-
-initialize_default_user()
-
-def load_users():
-    if not os.path.exists(USER_DATA_FILE):
-        return {}
-    try:
-        with open(USER_DATA_FILE, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return {}
+QR_FOLDER = os.path.join(BASE_DIR, "static", "qr_codes")
+os.makedirs(QR_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-def save_users(users):
-    with open(USER_DATA_FILE, 'w', encoding='utf-8') as file:
-        json.dump(users, file, indent=4)
+EMAIL_REGEX = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+MAX_EMAIL_LENGTH = 255
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "securedoc6@gmail.com"
+SENDER_PASSWORD = "cwmb ljuj mzfa knpu"   # Gmail App Password
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,   # Already true, but explicit
+    SESSION_COOKIE_SECURE=True,     # Only send cookie over HTTPS
+    SESSION_COOKIE_SAMESITE='Lax'   # Prevent CSRF while keeping usability
+)
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' https://cdn.jsdelivr.net; "
+        "connect-src 'self' https://cdn.jsdelivr.net; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    return response
+
+
+def generate_otp():
+    return str(random.randint(100000, 999999))
 
 
 def get_current_user():
-    email = session.get('user_email')
-    if not email:
+    user_id = session.get('user_id')
+    if not user_id:
         return None
-    users = load_users()
-    return users.get(email)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT user_id, name, email,
+               COALESCE(profile_pic_path, 'profile_pics/default.jpg')
+        FROM Users
+        WHERE user_id = ?
+    """, user_id)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "user_id": row[0],
+        "name": row[1],
+        "email": row[2],
+        "profile_pic_path": row[3],
+    }
 
 
-def login_required(view_func):
-    @wraps(view_func)
-    def wrapped_view(*args, **kwargs):
-        if 'user_email' not in session:
+def login_required(f):
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        if 'user_id' not in session:
+            # Check if it's an AJAX request
+            if request.is_json or request.headers.get('Content-Type') == 'application/json' or request.method == 'POST':
+                return jsonify({'error': 'Authentication required. Please login.', 'redirect': url_for('login')}), 401
             return redirect(url_for('login'))
-        return view_func(*args, **kwargs)
-
-    return wrapped_view
+        return f(*args, **kwargs)
+    return wrap
 
 
 def allowed_profile_picture(filename):
@@ -134,116 +167,461 @@ def save_profile_picture(file, email):
     )
     extension = file.filename.rsplit('.', 1)[1].lower()
     stored_name = f"{filename}.{extension}"
-    save_path = os.path.join(app.config['PROFILE_PIC_FOLDER'], stored_name)
-    file.save(save_path)
     return stored_name
 
 
 @app.route('/')
 def home():
-    if 'user_email' in session:
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
 
 
 @app.route('/dashboard')
-@login_required
 def dashboard():
-    user = get_current_user()
+    # Check if user is logged in
+    user_id = session.get('user_id')
+    user = None
+    
+    if user_id:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT user_id, name, email, COALESCE(profile_pic_path, 'default.jpg')
+            FROM Users
+            WHERE user_id = ?
+        """, user_id)
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            user = {
+                'user_id': row[0],
+                'name': row[1],
+                'email': row[2],
+                'profile_pic_path': row[3] if row[3] else 'default.jpg'
+            }
+
     return render_template('index.html', user=user)
 
 
+def is_valid_email(email):
+    return re.match(EMAIL_REGEX, email) and len(email) <= 255
+
+def sanitize_input(value):
+    dangerous = ["..", "/", "\\", "%2f", "%5c"]
+    for d in dangerous:
+        if d in value.lower():
+            return None
+    return value
+
 @app.route('/login', methods=['GET', 'POST'])
+@csrf.exempt
 def login():
-    if 'user_email' in session:
-        return redirect(url_for('dashboard'))
+    
+    if request.method == 'GET':
+        return render_template('login.html')
 
-    error = None
     if request.method == 'POST':
-        email = request.form.get('email', '').strip().lower()
-        password = request.form.get('password', '')
-        users = load_users()
-        user = users.get(email)
+        try:
+            validate_csrf(request.form.get('csrf_token'))
+        except ValidationError:
+            return render_template("login.html", error="Invalid CSRF token"), 400
 
-        if user and check_password_hash(user['password'], password):
+    # Normalize email (lowercase and strip) to match registration
+    email = sanitize_input(request.form.get('email', '')).strip().lower()
+    password = request.form.get('password', '')
+
+    if not email or not password:
+        return render_template('login.html', error='Email and password are required')
+    
+    if not is_valid_email(email):
+        return render_template("login.html", error="Invalid email format"), 400
+    
+    if not email:
+        return "Invalid characters in input", 400
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT user_id, password_hash FROM Users WHERE email = ?",
+            email
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            print(f"Login attempt: User with email '{email}' not found in database")
+            return render_template('login.html', error='Invalid email or password')
+        
+        user_id, password_hash = row[0], row[1]
+        
+        # Check if password hash is valid
+        if not password_hash:
+            print(f"Login attempt: User {user_id} has no password hash")
+            return render_template('login.html', error='Account error. Please contact support.')
+        
+        # Verify password
+        if check_password_hash(password_hash, password):
+            session['user_id'] = user_id
             session['user_email'] = email
+            print(f"Login successful: User {user_id} ({email})")
             return redirect(url_for('dashboard'))
+        else:
+            print(f"Login attempt: Invalid password for user {user_id} ({email})")
+            return render_template('login.html', error='Invalid email or password')
+            
+    except Exception as e:
+        print(f"Login error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return render_template('login.html', error='Login error. Please try again.')
+    finally:
+        conn.close()
 
-        error = 'Invalid email or password'
+@app.route('/profile_picture/<int:user_id>')
+@login_required
+def get_profile_picture(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    return render_template('login.html', error=error)
+    cursor.execute("""
+        SELECT profile_pic_path
+        FROM Users WHERE user_id = ?
+    """, user_id)
 
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        return '', 404
+
+    return Response(row[0], mimetype=row[1])
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    if 'user_email' in session:
-        return redirect(url_for('dashboard'))
 
-    error = None
-    if request.method == 'POST':
-        name = request.form.get('name', '').strip()
-        email = request.form.get('email', '').strip().lower()
-        password = request.form.get('password', '')
-        confirm_password = request.form.get('confirm_password', '')
-        profile_picture = request.files.get('profile_picture')
+        if 'user_id' in session:
+            return redirect(url_for('dashboard'))
 
-        if not name or not email or not password:
-            error = 'All fields are required'
-        elif password != confirm_password:
-            error = 'Passwords do not match'
-        else:
-            users = load_users()
-            if email in users:
-                error = 'An account with this email already exists'
-            else:
-                profile_filename = save_profile_picture(profile_picture, email)
-                # Fallback to bundled default avatar if user didn't upload one
-                if not profile_filename:
-                    profile_filename = 'default.png'
-                users[email] = {
-                    'name': name,
-                    'email': email,
-                    'password': generate_password_hash(password),
-                    'profile_picture': profile_filename,
-                }
-                save_users(users)
-                session['user_email'] = email
-                return redirect(url_for('dashboard'))
+        error = None
 
-    return render_template('register.html', error=error)
+        if request.method == 'POST':
+            name = request.form.get('name', '').strip()
+            email = request.form.get('email', '').strip().lower()
+            password = request.form.get('password', '')
+            confirm_password = request.form.get('confirm_password', '')
+
+            if not name or not email or not password:
+                error = 'All fields are required'
+            elif password != confirm_password:
+                error = 'Passwords do not match'
+
+            elif len(email) > MAX_EMAIL_LENGTH:
+                return jsonify({"error": "Email too long"}), 400
+            
+            elif not is_valid_email(email):
+                error = "Invalid email format"
+                
+            if error:
+                return render_template("register.html", error=error)
+            
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+
+                # Check if email exists
+                cursor.execute("SELECT user_id FROM Users WHERE email = ?", email)
+                if cursor.fetchone():
+                    error = "An account with this email already exists"
+                else:
+                    # Hash password
+                    hashed = generate_password_hash(password)
+
+                    # Handle profile picture (store PATH only)
+                    pic = request.files.get("profile_picture")
+                    pic_path = None
+
+                    if pic and pic.filename:
+                        filename = secure_filename(f"{email}_{int(time.time())}.jpg")
+                        save_path = os.path.join("static/profile_pics", filename)
+                        pic.save(save_path)
+                        pic_path = f"profile_pics/{filename}"
+                    else:
+                        pic_path = "profile_pics/default.jpg"
+
+                    # Insert user
+                    cursor.execute("""
+                        INSERT INTO Users (name, email, password_hash, profile_pic_path)
+                        VALUES (?, ?, ?, ?)
+                    """, name, email, hashed, pic_path)
+
+                    conn.commit()
+
+                    cursor.execute("SELECT user_id FROM Users WHERE email=?", email)
+                    user_id = cursor.fetchone()[0]
+
+                    session["user_id"] = user_id
+                    session["user_email"] = email
+
+                    conn.close()
+
+                    return redirect(url_for("dashboard"))
+                
+            except Exception as e:
+                if conn: 
+                    conn.rollback()
+                error="Registration failed due to invalid input"
+                return render_template("register.html", error=error)
+    
+        return render_template("register.html", error=error)
 
 
 @app.route('/logout')
-@login_required
 def logout():
+    session.pop('user_id', None)
     session.pop('user_email', None)
-    session.pop('otp', None)
-    session.pop('qr_data', None)
-    return redirect(url_for('login'))
-
+    session.clear()
+    return redirect(url_for('dashboard'))
 
 @app.route('/profile')
 @login_required
 def profile():
     user = get_current_user()
+
     profile_picture_url = None
-    if user and user.get('profile_picture'):
+    if user:
         profile_picture_url = url_for(
-            'static', filename=f"{PROFILE_PIC_URL_PREFIX}/{user['profile_picture']}"
+            'get_profile_picture',
+            user_id=user['user_id']
         )
-    return render_template('profile.html', user=user, profile_picture_url=profile_picture_url)
+
+    return render_template(
+        'profile.html',
+        user=user,
+        profile_picture_url=profile_picture_url
+    )
 
 
-@app.route('/uploads/<path:filename>')
+@app.route('/update_profile', methods=['POST'])
 @login_required
-def get_uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+def update_profile():
+    """Update user's profile information"""
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'User session expired'}), 401
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get current user data
+            cursor.execute("SELECT email FROM Users WHERE user_id = ?", user_id)
+            user_row = cursor.fetchone()
+            if not user_row:
+                conn.close()
+                return jsonify({'error': 'User not found'}), 404
+            
+            user_email = user_row[0]
+            updates = []
+            params = []
+
+            # Update name if provided
+            if 'name' in request.form and request.form['name'].strip():
+                new_name = request.form['name'].strip()
+                if len(new_name) < 2:
+                    conn.close()
+                    return jsonify({'error': 'Name must be at least 2 characters'}), 400
+                updates.append("name = ?")
+                params.append(new_name)
+
+            # Update email if provided
+            if 'email' in request.form and request.form['email'].strip():
+                new_email = request.form['email'].strip().lower()
+                if '@' not in new_email:
+                    conn.close()
+                    return jsonify({'error': 'Invalid email format'}), 400
+                
+                # Check if email is already taken by another user
+                cursor.execute("SELECT user_id FROM Users WHERE email = ? AND user_id != ?", (new_email, user_id))
+                if cursor.fetchone():
+                    conn.close()
+                    return jsonify({'error': 'Email already in use'}), 400
+                
+                updates.append("email = ?")
+                params.append(new_email)
+
+            # Update password if provided
+            if 'password' in request.form and request.form['password']:
+                new_password = request.form['password']
+                if len(new_password) < 6:
+                    conn.close()
+                    return jsonify({'error': 'Password must be at least 6 characters'}), 400
+                
+                # Verify current password if provided
+                if 'current_password' in request.form and request.form['current_password']:
+                    cursor.execute("SELECT password_hash FROM Users WHERE user_id = ?", user_id)
+                    current_hash = cursor.fetchone()[0]
+                    if not check_password_hash(current_hash, request.form['current_password']):
+                        conn.close()
+                        return jsonify({'error': 'Current password is incorrect'}), 400
+                
+                hashed_password = generate_password_hash(new_password)
+                updates.append("password_hash = ?")
+                params.append(hashed_password)
+
+            # Update profile picture if provided
+            if 'profile_picture' in request.files:
+                profile_picture_file = request.files['profile_picture']
+                if profile_picture_file.filename != '':
+                    stored_name = save_profile_picture(profile_picture_file, user_email)
+                    if stored_name:
+                        # Save the file to disk
+                        save_path = os.path.join("static/profile_pics", stored_name)
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                        profile_picture_file.seek(0)  # Reset file pointer
+                        profile_picture_file.save(save_path)
+                        
+                        updates.append("profile_pic_path = ?")
+                        params.append(f"profile_pics/{stored_name}")
+
+            # Execute update if there are any changes
+            if updates:
+                params.append(user_id)
+                update_query = f"UPDATE Users SET {', '.join(updates)} WHERE user_id = ?"
+                cursor.execute(update_query, params)
+                conn.commit()
+                
+                # Get updated user data
+                cursor.execute("""
+                    SELECT user_id, name, email, COALESCE(profile_pic_path, 'profile_pics/default.jpg')
+                    FROM Users WHERE user_id = ?
+                """, user_id)
+                updated_row = cursor.fetchone()
+                conn.close()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Profile updated successfully',
+                    'user': {
+                        'user_id': updated_row[0],
+                        'name': updated_row[1],
+                        'email': updated_row[2],
+                        'profile_pic_path': updated_row[3]
+                    }
+                })
+            else:
+                conn.close()
+                return jsonify({'error': 'No changes provided'}), 400
+                
+        except Exception as db_error:
+            conn.rollback()
+            conn.close()
+            print(f"Database error updating profile: {str(db_error)}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+    except Exception as e:
+        print(f"Error updating profile: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to update profile: {str(e)}'}), 500
+
+
+@app.route('/update_profile_picture', methods=['POST'])
+@login_required
+def update_profile_picture():
+    """Update user's profile picture in database"""
+    try:
+        user_id = session.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'User session expired'}), 401
+
+        if 'profile_picture' not in request.files:
+            return jsonify({'error': 'No profile picture provided'}), 400
+
+        profile_picture_file = request.files['profile_picture']
+        if profile_picture_file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Get user email for filename
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("SELECT email FROM Users WHERE user_id = ?", user_id)
+            user_row = cursor.fetchone()
+            if not user_row:
+                conn.close()
+                return jsonify({'error': 'User not found'}), 404
+            
+            user_email = user_row[0]
+
+            # Save the new profile picture
+            saved_pic = save_profile_picture(profile_picture_file, user_email)
+            if not saved_pic:
+                conn.close()
+                return jsonify({'error': 'Failed to save profile picture'}), 500
+
+            # Update database with new profile picture path
+            cursor.execute("""
+                UPDATE Users 
+                SET profile_pic_path = ? 
+                WHERE user_id = ?
+            """, saved_pic, user_id)
+
+            conn.commit()
+            conn.close()
+
+            return jsonify({
+                'success': True,
+                'message': 'Profile picture updated successfully',
+                'profile_picture': saved_pic
+            })
+        except Exception as db_error:
+            conn.rollback()
+            conn.close()
+            print(f"Database error updating profile picture: {str(db_error)}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({'error': f'Database error: {str(db_error)}'}), 500
+    except Exception as e:
+        print(f"Error updating profile picture: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to update profile picture: {str(e)}'}), 500
+
+
+@app.route('/download/<int:file_id>')
+def download_file(file_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT file_blob, file_name, file_mime
+        FROM Files
+        WHERE file_id = ?
+    """, file_id)
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return "File not found", 404
+
+    return Response(
+        row[0],
+        mimetype=row[2],
+        headers={
+            "Content-Disposition": f"attachment; filename={row[1]}"
+        }
+    )
+
 
 # Email configuration
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "cyloixy2610@gmail.com"  # Your Gmail address
-SENDER_PASSWORD = "jnzb bvae knot evss"  # Your Gmail App Password
+SENDER_EMAIL = "securedoc6@gmail.com"  # Your Gmail address
+SENDER_PASSWORD = "cwmb ljuj mzfa knpu"  # Your Gmail App Password
 
 # Initialize Mediapipe Face Detection
 mp_face_detection = mp.solutions.face_detection
@@ -251,7 +629,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 # Thread class for video capture
 class VideoCaptureThread(threading.Thread):
-    def __init__(self, src=0, width=640, height=480, queue_size=2):
+    def __init__(self, src=0, width=640, height=450, queue_size=2):
         super().__init__()
         self.capture = cv2.VideoCapture(src, cv2.CAP_DSHOW)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -281,158 +659,28 @@ class VideoCaptureThread(threading.Thread):
         self.stopped = True
         self.capture.release()
 
-def load_known_faces(directory):
-    if not os.path.isabs(directory):
-        directory = os.path.join(BASE_DIR, directory)
-    known_face_encodings = []
-    known_face_names = []
-    print(f"Loading encodings for faces from directory: {directory}")
-    
-    # Check if directory exists
-    if not os.path.exists(directory):
-        print(f"Creating directory: {directory}")
-        os.makedirs(directory)
-        return np.array([]), []
 
-    # List all files in directory
-    files = os.listdir(directory)
-    print(f"Found {len(files)} files in directory")
-    
-    for filename in files:
-        if filename.lower().endswith((".jpg", ".png")):
-            image_path = os.path.join(directory, filename)
-            name, _ = os.path.splitext(filename)
-            pkl_path = os.path.join(directory, f"{name}.pkl")
-            
-            print(f"Processing file: {filename}")
-            
-            if os.path.exists(pkl_path):
-                try:
-                    with open(pkl_path, 'rb') as pkl_file:
-                        encoding = pickle.load(pkl_file)
-                        known_face_encodings.append(encoding)
-                        known_face_names.append(name)
-                        print(f"Loaded encoding from {pkl_path}")
-                except Exception as e:
-                    print(f"Error loading {pkl_path}: {e}")
-            else:
-                try:
-                    print(f"Generating new encoding for {image_path}")
-                    image = face_recognition.load_image_file(image_path)
-                    face_encodings = face_recognition.face_encodings(image)
-                    if face_encodings:
-                        encoding = face_encodings[0]
-                        known_face_encodings.append(encoding)
-                        known_face_names.append(name)
-                        print(f"Generated and saved encoding for {image_path}")
+def send_otp_email(to_email, otp):
 
-                        with open(pkl_path, 'wb') as pkl_file:
-                            pickle.dump(encoding, pkl_file)
-                    else:
-                        print(f"No faces found in {image_path}. Skipping.")
-                except Exception as e:
-                    print(f"Error processing {image_path}: {e}")
+    msg = MIMEMultipart()   
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = to_email
+    msg['Subject'] =  "OTP Verification Code"
+    body = f"""
+Your One-Time Password (OTP) is:
 
-    known_face_encodings = np.array(known_face_encodings)
-    print(f"Loaded {len(known_face_names)} known faces: {known_face_names}")
-    return known_face_encodings, known_face_names
+{otp}
 
-def verify_face_with_mediapipe():
-    # Load known faces
-    known_face_encodings, known_face_names = load_known_faces(app.config['KNOWN_FACES'])
-    
-    # Initialize camera
-    video_capture = VideoCaptureThread(src=1, width=720, height=720, queue_size=2)
-    video_capture.start()
-    
-    try:
-        process_every_n_frames = 2  # Process every 2nd frame
-        frame_count = 0
-        
-        # Variables for face tracking
-        previous_face_locations = []
-        previous_face_names = []
-        
-        while True:
-            if video_capture.more():
-                frame = video_capture.read()
-                frame_count += 1
-                
-                # Only process every nth frame
-                if frame_count % process_every_n_frames == 0:
-                    # Resize frame to 1/2 size for faster processing
-                    small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-                    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                    
-                    # Detect faces using HOG (faster than MediaPipe)
-                    face_locations = face_recognition.face_locations(rgb_small_frame, model='hog')
-                    
-                    if face_locations:
-                        # Get face encodings for the detected faces
-                        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-                        
-                        for face_encoding in face_encodings:
-                            if len(known_face_encodings) > 0:
-                                # Compare with known faces using NumPy for faster computation
-                                distances = np.linalg.norm(known_face_encodings - face_encoding, axis=1)
-                                best_match_index = np.argmin(distances)
-                                dist = distances[best_match_index]
-                                
-                                if dist <= 0.6:
-                                    name = known_face_names[best_match_index]
-                                    confidence = (1 - dist) * 100
-                                    return name, confidence
-                                else:
-                                    return "Unknown", 0
-                    
-                    # Display the frame
-                    for (top, right, bottom, left) in face_locations:
-                        # Scale back up face locations
-                        top *= 2
-                        right *= 2
-                        bottom *= 2
-                        left *= 2
-                        cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-                    
-                    cv2.imshow("Face Verification", frame)
-                    
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        return "Unknown", 0
-    
-    finally:
-        video_capture.stop()
-        video_capture.join()
-        cv2.destroyAllWindows()
+This code is valid for 5 minutes.
+"""
+    msg.attach(MIMEText(body.strip(), 'plain'))
 
-def generate_otp():
-    """Generate a random 6-digit OTP"""
-    otp = ""
-    for i in range(6):
-        otp += str(random.randint(0, 9))
-    return otp
+    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+    server.starttls()
+    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+    server.send_message(msg)
+    server.quit()
 
-def send_otp_email(recipient_email, otp):
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        
-        from_mail = 'cyloixy2610@gmail.com'
-        server.login(from_mail, 'jnzb bvae knot evss')
-        
-        msg = EmailMessage()
-        msg['Subject'] = "OTP Verification"
-        msg['From'] = from_mail
-        msg['To'] = recipient_email
-        msg.set_content(f"Your OTP is: {otp}")
-        
-        print("Sending email...")
-        server.send_message(msg)
-        print("Email sent successfully")
-        server.quit()
-        return True
-    except Exception as e:
-        print(f"Email error: {e}")
-        return False
 
 @app.route('/')
 def index():
@@ -440,355 +688,743 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 @login_required
-def upload_document():
-    # Collect all receiver photos and emails
-    photos = []
-    emails = []
-    index = 0
-    
-    # Collect all photos (photo_0, photo_1, etc.)
-    while f'photo_{index}' in request.files:
-        photo = request.files[f'photo_{index}']
-        if photo and photo.filename != '':
-            photos.append(photo)
-        index += 1
-    
-    # Collect all emails (email_0, email_1, etc.)
-    index = 0
-    while f'email_{index}' in request.form:
-        email = request.form.get(f'email_{index}', '').strip()
-        if email:
-            emails.append(email)
-        index += 1
-    
-    if not photos or not emails:
-        return jsonify({'error': 'At least one receiver with photo and email is required'}), 400
-    
-    if len(photos) != len(emails):
-        return jsonify({'error': 'Number of photos and emails must match'}), 400
-    
-    # Determine file source: direct upload or link
-    file_link = None
-    if 'document' in request.files and request.files['document'].filename != '':
-        # User uploaded a file directly - save it and use as link
-        document_file = request.files['document']
-        if not allowed_document(document_file.filename):
-            return jsonify({'error': 'Invalid file type. Only PDF and DOCX files are allowed.'}), 400
-        # Use first email for filename (or generate a generic one)
-        base_email = emails[0] if emails else 'document'
-        document_filename = secure_filename(f"{base_email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{document_file.filename}")
-        document_path = os.path.join(app.config['UPLOAD_FOLDER'], document_filename)
-        document_file.save(document_path)
-        file_link = url_for('get_uploaded_file', filename=document_filename, _external=True)
-    else:
-        # User provided a file link
-        file_link = request.form.get('fileLink')
-    
-    if not file_link:
-        return jsonify({'error': 'Please provide either a document file or a file link'}), 400
-    
-    # Get expiration time from form (in hours, default to 24 hours if not provided)
-    expiration_hours = request.form.get('expiration_hours', '24')
+def upload():
+    user = get_current_user()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
     try:
-        expiration_hours = float(expiration_hours)
-        if expiration_hours <= 0:
-            expiration_hours = 24  # Default to 24 hours if invalid
-    except (ValueError, TypeError):
-        expiration_hours = 24  # Default to 24 hours if invalid
-    
-    # Calculate expiration timestamp
-    expiration_timestamp = time.time() + (expiration_hours * 3600)  # Convert hours to seconds
-    
-    # Process each receiver and generate QR codes
-    qr_urls = []
-    for i, (photo, email) in enumerate(zip(photos, emails)):
-        # Save the photo
-        photo_filename = secure_filename(f"{email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.jpg")
-        photo_path = os.path.join(app.config['KNOWN_FACES'], photo_filename)
-        photo.save(photo_path)
+        # -----------------------------
+        # 1. Receive file or file link
+        # -----------------------------
+        file = request.files.get('document')
+        fileLink = request.form.get('fileLink', '').strip()
+
+        if file and file.filename:
+            original_name = secure_filename(file.filename)
+            file_bytes = file.read()
+            mime_type = file.mimetype
+            file_source = "upload"
+
+        elif fileLink:
+            try:
+                r = requests.get(fileLink, timeout=10)
+                if r.status_code != 200:
+                    return jsonify({"error": "Failed to download file from URL"}), 400
+                
+                file_bytes = r.content
+                original_name = fileLink.split("/")[-1]
+                mime_type = "application/octet-stream"
+                file_source = "url"
+
+            except Exception as e:
+                return jsonify({"error": "Invalid or unreachable URL"}), 400
+        else:
+            return jsonify({"error": "No file provided"}), 400
+
+        # -----------------------------
+        # 2. Encrypt file with AES-GCM
+        # -----------------------------
+        aes_key = get_random_bytes(32)
+        iv = get_random_bytes(12)
+
+        cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+        ciphertext, tag = cipher.encrypt_and_digest(file_bytes)
+
+        # Store ciphertext + tag together
+        encrypted_blob = ciphertext + tag
+
+        # -----------------------------
+        # 3. Save encrypted file to disk
+        # -----------------------------
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stored_filename = f"{timestamp}_{original_name}"
+        stored_path = os.path.join("static", "uploads", stored_filename)
+        abs_path = os.path.join(BASE_DIR, stored_path)
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+        with open(abs_path, "wb") as f:
+            f.write(encrypted_blob)
+
+        # -----------------------------
+        # 4. Insert into Files table
+        # -----------------------------
+        expiration_hours = float(request.form.get("expiration_hours", 24))
+        expiration_timestamp = datetime.now() + timedelta(hours=expiration_hours)
+
+        cursor.execute("""
+            INSERT INTO Files (uploaded_by, file_path, file_name, file_mime, expiration_timestamp, file_url, file_source)
+            OUTPUT INSERTED.file_id
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user['user_id'],
+            stored_path,  # Always set file_path since encrypted file is saved to disk for both upload and URL sources
+            original_name,
+            mime_type,
+            expiration_timestamp,
+            fileLink if file_source == "url" else None,
+            file_source
+        ))
+
+
+        file_id = cursor.fetchone()[0]
+
+        # -----------------------------
+        # 5. Insert AES key into FileKey
+        # -----------------------------
+        cursor.execute("""
+            INSERT INTO FileKey (file_id, aes_key, iv, tag)
+            VALUES (?, ?, ?, ?)
+        """, (file_id, aes_key, iv, tag))
+
+    # -----------------------------
+    # 6. Handle receiver photos + face encodings
+    # -----------------------------
+        receiver_index = 0
+        receiver_results = []
+
+        print(f"🔍 Checking for receiver photos...")
+        while f"photo_{receiver_index}" in request.files:
+            print(f"📸 Processing receiver {receiver_index}...")
+            photo_file = request.files[f"photo_{receiver_index}"]
+            receiver_email = request.form.get(f"email_{receiver_index}").strip().lower()
+
+            # -----------------------------
+            # Save receiver photo
+            # -----------------------------
+            photo_filename = f"{receiver_email}_{timestamp}_{receiver_index}.jpg"
+            photo_path_rel = f"static/receiver_faces/{photo_filename}"
+            photo_path_abs = os.path.join(BASE_DIR, photo_path_rel)
+            
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(photo_path_abs), exist_ok=True)
+            photo_file.save(photo_path_abs)
+            print(f"📷 Receiver photo saved to: {photo_path_abs}")
+
+            # -----------------------------
+            # Generate face encoding
+            # -----------------------------
+            img = face_recognition.load_image_file(photo_path_abs)
+            enc = face_recognition.face_encodings(img)
+
+            if not enc:
+                conn.rollback()
+                return jsonify({"error": f"No face detected for {receiver_email}"}), 400
+
+            encoding_blob = pickle.dumps(enc[0])
+
+            # Store face encoding in DB
+            cursor.execute("""
+                INSERT INTO ReceiverFace (file_id, receiver_email, photo_path, face_encoding)
+                VALUES (?, ?, ?, ?)
+            """, (file_id, receiver_email, photo_path_rel, encoding_blob))
+
+            # -----------------------------
+            # Generate QR payload
+            # -----------------------------
+            qr_payload = {
+                "file_id": file_id,
+                "receiver_email": receiver_email,
+                "expiry": expiration_timestamp.isoformat()
+            }
+
+            qr_json = json.dumps(qr_payload)
+            print(f"📝 Generated QR payload for {receiver_email}: {qr_json}")
+
+            # -----------------------------
+            # Generate QR PNG
+            # -----------------------------
+            qr_img = qrcode.make(qr_json)
+            print(f"🎨 QR image object created")
+
+            qr_filename = f"qr_{receiver_email}_{timestamp}_{receiver_index}.png"
+            qr_disk_rel = f"static/qr_codes/{qr_filename}"
+            qr_disk_abs = os.path.join(BASE_DIR, qr_disk_rel)
+
+            # Ensure directory exists before saving
+            os.makedirs(os.path.dirname(qr_disk_abs), exist_ok=True)
+            
+            try:
+                qr_img.save(qr_disk_abs)
+                print(f"✓ QR code saved to: {qr_disk_abs}")
+            except Exception as save_error:
+                print(f"✗ Error saving QR code: {save_error}")
+                raise
+
+            # -----------------------------
+            # Save QR metadata to DB
+            # -----------------------------
+            cursor.execute("""
+                INSERT INTO QRCode (file_id, receiver_email, qr_image_path, qr_metadata)
+                OUTPUT INSERTED.qr_id
+                VALUES (?, ?, ?, ?)
+            """, (
+                file_id,
+                receiver_email,
+                qr_disk_rel,     # save RELATIVE path
+                qr_json
+            ))
+
+            qr_id = cursor.fetchone()[0]
+            print(f"✅ QR code saved to database with ID: {qr_id}")
+
+            receiver_results.append({
+                "email": receiver_email,
+                "qr_id": qr_id,
+                "qr_path": "/" + qr_disk_rel.replace("\\", "/")   # for download
+            })
+
+            receiver_index += 1
         
-        # Generate encryption key for this receiver
-        key = Fernet.generate_key()
-        f = Fernet(key)
-        
-        # Encrypt the file link
-        encrypted_link = f.encrypt(file_link.encode())
-        
-        # Create QR code data
-        qr_data = {
-            'key': key.decode(),
-            'encrypted_link': encrypted_link.decode(),
-            'email': email,
-            'expiration_timestamp': expiration_timestamp
-        }
-        
-        # Generate QR code
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
-        qr.add_data(json.dumps(qr_data))
-        qr.make(fit=True)
-        qr_image = qr.make_image(fill_color="black", back_color="white")
-        
-        # Save QR code
-        qr_filename = f"qr_{email}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{i}.png"
-        qr_path = os.path.join(app.config['UPLOAD_FOLDER'], qr_filename)
-        qr_image.save(qr_path)
-        qr_url = url_for('get_uploaded_file', filename=qr_filename)
-        qr_urls.append({
-            'email': email,
-            'qr_path': qr_url
+        print(f"📊 Total receivers processed: {receiver_index}")
+
+
+        conn.commit()
+        print(f"💾 Database transaction committed")
+
+        # Convert receiver_results → qr_codes format for frontend
+        qr_codes = []
+        for r in receiver_results:
+            qr_codes.append({
+                "email": r["email"],
+                "qr_id": r["qr_id"],
+                "qr_path": f"/qr/{r['qr_id']}"
+            })
+
+        print(f"📤 Returning {len(qr_codes)} QR code(s) to frontend")
+        return jsonify({
+            "success": True,
+            "qr_codes": qr_codes
         })
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error in upload route: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        conn.close()
+
     
-    return jsonify({
-        'success': True,
-        'message': f'Document processed, {len(qr_urls)} QR code(s) generated',
-        'qr_codes': qr_urls
-    })
+@app.route('/qr/<int:qr_id>')
+@login_required
+def get_qr(qr_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT qr_image_path
+        FROM QRCode
+        WHERE qr_id = ?
+    """, qr_id)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return "QR not found", 404
+
+    qr_path = row[0]
+    abs_path = os.path.join(app.root_path, qr_path)
+
+    return send_file(abs_path, mimetype="image/png")
+
 
 
 @app.route('/scan', methods=['POST'])
-@login_required
+@csrf.exempt
 def scan_qr():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    # Save the uploaded QR code image
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-    
-    # Read QR code
-    image = cv2.imread(filepath)
-    decoded_objs = decode(image)
-    
-    if not decoded_objs:
-        return jsonify({'error': 'No QR code found in image'}), 400
-    
     try:
-        qr_data = json.loads(decoded_objs[0].data.decode())
-        
-        # Check if QR code has expired
-        expiration_timestamp = qr_data.get('expiration_timestamp')
-        if expiration_timestamp:
-            current_time = time.time()
-            if current_time > expiration_timestamp:
-                # Calculate how long it has been expired
-                expired_seconds = current_time - expiration_timestamp
-                expired_hours = expired_seconds / 3600
-                expired_days = expired_hours / 24
-                
-                if expired_days >= 1:
-                    expired_message = f'QR code has expired {expired_days:.1f} days ago'
-                elif expired_hours >= 1:
-                    expired_message = f'QR code has expired {expired_hours:.1f} hours ago'
-                else:
-                    expired_minutes = expired_seconds / 60
-                    expired_message = f'QR code has expired {expired_minutes:.1f} minutes ago'
-                
-                return jsonify({
-                    'error': 'QR code has expired',
-                    'message': expired_message,
-                    'expired': True
-                }), 400
-        
-        session['qr_data'] = qr_data
-        
-        return jsonify({
-            'success': True,
-            'message': 'QR code scanned successfully'
-        })
-            
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+        decoded = decode(img)
+
+        if not decoded:
+            return jsonify({"error": "Invalid QR code"}), 400
+
+        qr_data = json.loads(decoded[0].data.decode("utf-8"))
+
+        # Check expiry
+        if datetime.now() > datetime.fromisoformat(qr_data["expiry"]):
+            return jsonify({"expired": True, "message": "QR code expired"}), 200
+
+        session["qr_data"] = qr_data
+        session["otp_sent"] = False
+        session["log_id"] = None
+
+        return jsonify({"success": True})
+
     except Exception as e:
-        return jsonify({'error': f'Error processing QR code: {str(e)}'}), 400
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/verify_face', methods=['POST'])
-@login_required
-def verify_face():
-    try:
-        print("Starting face verification...")
-        user = get_current_user()
-        # Start face recognition using MediaPipe
-        name, confidence = verify_face_with_mediapipe()
-        print(f"Face verification result - Name: {name}, Confidence: {confidence}")
-        
-        if name != "Unknown" and confidence > 50:
-            print("Face verified successfully, generating OTP...")
-            # Generate OTP
-            otp = generate_otp()
-            print(f"Generated OTP: {otp}")
-            
-            # Store OTP in session
-            session['otp'] = otp
-            session['otp_timestamp'] = time.time()
-            
-            # Send OTP email
-            print("Attempting to send OTP email...")
-            recipient_email = user['email'] if user else session.get('user_email')
-            email_sent = send_otp_email(recipient_email, otp)
-            
-            if email_sent:
-                print("OTP email sent successfully")
-                return jsonify({
-                    'success': True,
-                    'message': 'Face verified, OTP sent to your email'
-                })
-            else:
-                print("Failed to send OTP email")
-                return jsonify({'error': 'Failed to send OTP'}), 500
-        else:
-            print(f"Face verification failed - Name: {name}, Confidence: {confidence}")
-            return jsonify({
-                'error': 'Face verification failed',
-                'message': 'Face not recognized or confidence too low'
-            }), 400
-            
-    except Exception as e:
-        print(f"Face verification error: {str(e)}")
-        return jsonify({'error': f'Face verification error: {str(e)}'}), 500
 
-@app.route('/verify_otp', methods=['POST'])
-@login_required
-def verify_otp():
-    data = request.get_json()
-    user_otp = data.get('otp')
-    stored_otp = session.get('otp')
-    
-    if not user_otp or not stored_otp:
-        return jsonify({'error': 'Invalid OTP'}), 400
-    
-    # Simple OTP comparison
-    if user_otp == stored_otp:
-        # Clear the OTP from session after successful verification
-        session.pop('otp', None)
-        
-        # Decrypt and return the file link
-        qr_data = session.get('qr_data')
-        if not qr_data:
-            return jsonify({'error': 'Session expired'}), 400
-        
-        key = qr_data['key'].encode()
-        encrypted_link = qr_data['encrypted_link'].encode()
-        
-        f = Fernet(key)
-        decrypted_link = f.decrypt(encrypted_link).decode()
-        
-        return jsonify({
-            'success': True,
-            'message': 'OTP verified successfully',
-            'file_link': decrypted_link
-        })
-    else:
-        return jsonify({'error': 'Invalid OTP'}), 400
-
+# =========================
+# FACE → OTP
+# =========================
 @app.route('/verify_face_stream', methods=['POST'])
-@login_required
+@csrf.exempt
 def verify_face_stream():
+
+    qr = session.get("qr_data")
+    if not qr:
+        print("⛔ No QR session")
+        return jsonify({"error": "No active QR session"}), 400
+
+    file_id = qr["file_id"]
+    receiver_email = qr["receiver_email"]
+
+    # Get stored face encoding
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT face_encoding FROM ReceiverFace
+        WHERE file_id=? AND receiver_email=?
+    """, (file_id, receiver_email))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        print("⛔ No face encoding found")
+        return jsonify({"error": "Receiver face not found"}), 400
+
+    known_encoding = pickle.loads(row[0])
+
+    # Process incoming frame
+    frame = request.files.get("frame").read()
+    img = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    enc = face_recognition.face_encodings(rgb)
+
+    if not enc:
+        return jsonify({"error": "No face detected"}), 200
+
+    dist = np.linalg.norm(known_encoding - enc[0])
+    confidence = (1 - dist) * 100
+    print("Face distance =", dist, ", confidence =", confidence)
+
+    if dist > 0.6:
+        return jsonify({"match": False}), 200
+
+    # ------------------------------
+    # 🔥 FIX: Use database lock to prevent duplicate OTP (race condition fix)
+    # ------------------------------
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
     try:
-        if 'frame' not in request.files:
-            print("No frame received in request")
-            return jsonify({'error': 'No frame provided'}), 400
-            
-        frame_file = request.files['frame']
-        # Read the frame as an image
-        frame_array = np.frombuffer(frame_file.read(), np.uint8)
-        frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+        # First check session (quick check before DB lock)
+        if session.get("otp_sent") == True:
+            log_id = session.get("log_id")
+            if log_id:
+                cursor.execute("""
+                    SELECT log_id, otp_code, otp_status
+                    FROM AccessLog
+                    WHERE log_id = ? AND file_id = ? AND receiver_email = ?
+                """, (log_id, file_id, receiver_email))
+                existing = cursor.fetchone()
+                
+                if existing and existing[2] == "Sent":
+                    conn.close()
+                    return jsonify({"success": True, "otp_sent": True}), 200
+
+        # Check database for existing unverified OTP with UPDLOCK to prevent race conditions
+        # UPDLOCK locks the rows until transaction commits, preventing concurrent inserts
+        cursor.execute("""
+            SELECT TOP 1 log_id, otp_code, otp_status, otp_created_at
+            FROM AccessLog WITH (UPDLOCK, ROWLOCK)
+            WHERE file_id = ? AND receiver_email = ? 
+            AND face_match_result = 1
+            AND otp_status = 'Sent'
+            ORDER BY access_time DESC
+        """, (file_id, receiver_email))
+        existing_record = cursor.fetchone()
         
-        if frame is None:
-            print("Failed to decode frame")
-            return jsonify({'error': 'Invalid frame data'}), 400
+        if existing_record:
+            # Reuse existing OTP if it's still valid (not verified)
+            log_id, otp, otp_status, otp_created_at = existing_record
             
-        print("Frame received and decoded successfully")
+            # Don't send email again if OTP was recently created (within last 5 minutes)
+            should_send_email = True
+            if otp_created_at is not None:
+                try:
+                    # Handle both datetime and string formats
+                    if isinstance(otp_created_at, str):
+                        otp_created_at = datetime.fromisoformat(otp_created_at.replace('Z', '+00:00'))
+                    time_diff = (datetime.now() - otp_created_at).total_seconds()
+                    if time_diff < 300:  # Don't resend if sent within last 5 minutes
+                        should_send_email = False
+                except Exception as e:
+                    print(f"Error checking OTP timestamp: {e}")
+            
+            conn.commit()
+            conn.close()
+            
+            # Update session
+            session["log_id"] = log_id
+            session["otp_sent"] = True
+            
+            # Send email only if needed
+            if should_send_email:
+                print("📧 Resending OTP email to:", receiver_email)
+                try:
+                    send_otp_email(receiver_email, otp)
+                    print("📧 Email sent successfully!")
+                except Exception as e:
+                    print("Email error:", e)
+            
+            return jsonify({"success": True, "otp_sent": True})
+
+        # Generate new OTP if none exists (inside transaction to prevent duplicates)
+        otp = str(random.randint(100000, 999999))
+        print("Generated new OTP:", otp)
+
+        cursor.execute("""
+            INSERT INTO AccessLog(
+                file_id, receiver_email,
+                face_match_result, confidence_score,
+                otp_code, otp_status, otp_created_at
+            )
+            OUTPUT INSERTED.log_id
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            file_id, receiver_email,
+            1, confidence,
+            otp, "Sent", datetime.now()
+        ))
+
+        log_id = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        # Save log_id + mark OTP sent (AFTER successful commit)
+        session["log_id"] = log_id
+        session["otp_sent"] = True
+
+        print("📧 Sending email to:", receiver_email)
+        try:
+            send_otp_email(receiver_email, otp)
+            print("📧 Email sent successfully!")
+        except Exception as e:
+            print("Email error:", e)
+
+        return jsonify({"success": True, "otp_sent": True})
         
-        # Resize frame for faster processing
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        
-        print("Starting face detection")
-        with mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_detection:
-            results = face_detection.process(rgb_small_frame)
-            
-            if results.detections:
-                print(f"Found {len(results.detections)} faces")
-                for detection in results.detections:
-                    bboxC = detection.location_data.relative_bounding_box
-                    ih, iw, _ = rgb_small_frame.shape
-                    x_min = int(bboxC.xmin * iw)
-                    y_min = int(bboxC.ymin * ih)
-                    width = int(bboxC.width * iw)
-                    height = int(bboxC.height * ih)
-                    
-                    top = y_min
-                    right = x_min + width
-                    bottom = y_min + height
-                    left = x_min
-                    
-                    print(f"Face detected at coordinates: left={left}, top={top}, right={right}, bottom={bottom}")
-                    
-                    # Always return face location for visualization
-                    face_location = {
-                        'left': left * 2,
-                        'top': top * 2,
-                        'width': width * 2,
-                        'height': height * 2
-                    }
-                    
-                    # Encode the face
-                    face_encoding = face_recognition.face_encodings(rgb_small_frame, [(top, right, bottom, left)])
-                    
-                    if face_encoding:
-                        print("Face encoded successfully")
-                        # Load known faces
-                        known_face_encodings, known_face_names = load_known_faces(app.config['KNOWN_FACES'])
-                        print(f"Loaded {len(known_face_names)} known faces")
-                        
-                        if len(known_face_encodings) > 0:
-                            distances = np.linalg.norm(known_face_encodings - face_encoding[0], axis=1)
-                            best_match_index = np.argmin(distances)
-                            dist = distances[best_match_index]
-                            
-                            print(f"Best match distance: {dist}")
-                            
-                            if dist <= 0.6:
-                                name = known_face_names[best_match_index]
-                                confidence = float((1 - dist) * 100)  # Convert to Python float
-                                print(f"Face recognized as {name} with {confidence}% confidence")
-                                return jsonify({
-                                    'success': True,
-                                    'name': name,
-                                    'confidence': confidence,
-                                    'face_location': face_location,
-                                    'should_close': bool(confidence > 50)  # Convert to Python boolean
-                                })
-                            else:
-                                confidence = float((1 - dist) * 100)  # Convert to Python float
-                                return jsonify({
-                                    'success': False,
-                                    'name': 'Unknown',
-                                    'confidence': confidence,
-                                    'face_location': face_location,
-                                    'should_close': False
-                                })
-                        else:
-                            return jsonify({
-                                'success': False,
-                                'face_location': face_location,
-                                'should_close': False
-                            })
-                    else:
-                        return jsonify({
-                            'success': False,
-                            'face_location': face_location,
-                            'should_close': False
-                        })
-            else:
-                return jsonify({'success': False})
-            
     except Exception as e:
-        print(f"Face verification error: {str(e)}")
-        return jsonify({'success': False})
+        conn.rollback()
+        conn.close()
+        print(f"Error in OTP generation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Failed to generate OTP"}), 500
+
+
+
+@app.route('/send_otp', methods=['POST'])
+@login_required
+def send_otp_route():
+    try:
+        qr = session.get("qr_data")
+        if not qr:
+            return jsonify({"error": "QR session not found"}), 400
+
+        otp = str(random.randint(100000, 999999))
+        session['otp'] = otp
+        session['otp_time'] = time.time()
+
+        send_otp_email(qr["receiver_email"], otp)
+
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# VERIFY OTP → DECRYPT
+# =========================
+@app.route('/verify_otp', methods=['POST'])
+@csrf.exempt
+def verify_otp():
+    try:
+        data = request.json
+        otp = data.get("otp", "")
+        log_id = session.get("log_id")
+
+        if not log_id:
+            return jsonify({"error": "No OTP session"}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT otp_code, file_id
+            FROM AccessLog
+            WHERE log_id=?
+        """, log_id)
+
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({"error": "Invalid log ID"}), 400
+
+        correct_otp, file_id = row
+
+        if otp != correct_otp:
+            conn.close()
+            return jsonify({"error": "Incorrect OTP"}), 200
+
+        # Update log
+        cursor.execute("""
+            UPDATE AccessLog
+            SET otp_status='Verified', access_result='Success'
+            WHERE log_id=?
+        """, log_id)
+        conn.commit()
+
+        # -------------------------------
+        # 🔥 NEW FEATURE: Notify sender
+        # -------------------------------
+
+        # 1. Get access timestamp + receiver email + file name + sender ID
+        cursor.execute("""
+            SELECT A.access_time, A.receiver_email, F.file_name, F.uploaded_by
+            FROM AccessLog A
+            JOIN Files F ON A.file_id = F.file_id
+            WHERE A.log_id = ?
+        """, (log_id,))
+        access_info = cursor.fetchone()
+
+        if access_info:
+            access_time, receiver_email, file_name, sender_id = access_info
+
+            # 2. Fetch sender's email
+            cursor.execute("SELECT email FROM Users WHERE user_id=?", (sender_id,))
+            sender_row = cursor.fetchone()
+
+            if sender_row:
+                sender_email = sender_row[0]
+
+                # 3. Send email to sender
+                try:
+                    msg = MIMEMultipart()
+                    msg["From"] = SENDER_EMAIL
+                    msg["To"] = sender_email
+                    msg["Subject"] = "Your Secure File Was Accessed"
+
+                    body = f"""
+                Hello,
+
+                Your shared file has been accessed.
+
+                📄 File: {file_name}
+                👤 Receiver: {receiver_email}
+                ⏳ Accessed At: {access_time}
+
+                If this was not expected, please review your security settings immediately.
+
+                This is an automated notification.
+                """
+                    msg.attach(MIMEText(body.strip(), "plain"))
+
+                    server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+                    server.starttls()
+                    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                    server.send_message(msg)
+                    server.quit()
+
+                    print(f"📧 Sender notified at {sender_email}")
+
+                except Exception as e:
+                    print("⚠ Error sending access notification email:", e)
+
+        conn.close()
+
+
+        session["verified_file_id"] = file_id
+
+        return jsonify({
+            "success": True,
+            "download_url": "/download_file"
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/download_secure")
+def download_secure_file():
+    try:
+        qr = session.get("qr_data")
+        if not qr:
+            return jsonify({"error": "No QR session"}), 400
+
+        file_id = qr["file_id"]
+        receiver_email = qr["receiver_email"]
+
+        # Check if OTP has been verified
+        log_id = session.get("log_id")
+        if not log_id:
+            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Verify OTP was verified for this file
+        cursor.execute("""
+            SELECT otp_status, access_result
+            FROM AccessLog
+            WHERE log_id = ? AND file_id = ? AND receiver_email = ?
+        """, (log_id, file_id, receiver_email))
+        
+        access_row = cursor.fetchone()
+        if not access_row or access_row[0] != "Verified":
+            conn.close()
+            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
+
+        # 1. Fetch file path and original filename
+        cursor.execute("""
+            SELECT file_path, file_name, file_url, file_source 
+            FROM Files WHERE file_id=?
+        """, (file_id,))
+
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "File not found"}), 404
+
+        file_path, original_filename, file_url, file_source = row
+
+        relative_path, original_filename = row[0], row[1]
+
+        # 2. Fetch AES keys
+        cursor.execute(
+            "SELECT aes_key, iv, tag FROM FileKey WHERE file_id=?",
+            (file_id,)
+        )
+        key_row = cursor.fetchone()
+        conn.close()
+
+        if not key_row:
+            return jsonify({"error": "Missing AES key"}), 500
+
+        aes_key, iv, tag_db = key_row  # tag_db stored but not used (tag is in file)
+
+        # Ensure aes_key and iv are bytes (they might be stored as VARBINARY)
+        if isinstance(aes_key, bytes):
+            pass  # Already bytes
+        elif isinstance(aes_key, bytearray):
+            aes_key = bytes(aes_key)
+        else:
+            # Try to convert from string/other format
+            try:
+                if isinstance(aes_key, str):
+                    aes_key = aes_key.encode('latin-1')
+                else:
+                    aes_key = bytes(aes_key)
+            except Exception as e:
+                print(f"Error converting aes_key to bytes: {e}")
+                return jsonify({"error": "Invalid AES key format"}), 500
+
+        if isinstance(iv, bytes):
+            pass  # Already bytes
+        elif isinstance(iv, bytearray):
+            iv = bytes(iv)
+        else:
+            # Try to convert from string/other format
+            try:
+                if isinstance(iv, str):
+                    iv = iv.encode('latin-1')
+                else:
+                    iv = bytes(iv)
+            except Exception as e:
+                print(f"Error converting IV to bytes: {e}")
+                return jsonify({"error": "Invalid IV format"}), 500
+
+        # Validate key and IV sizes
+        if len(aes_key) != 32:
+            print(f"Invalid AES key length: {len(aes_key)}, expected 32")
+            return jsonify({"error": "Invalid AES key size"}), 500
+        
+        if len(iv) != 12:
+            print(f"Invalid IV length: {len(iv)}, expected 12")
+            return jsonify({"error": "Invalid IV size"}), 500
+
+        # 3. Load encrypted file from disk
+        # If file is URL type → return immediately (no decryption)
+        if file_source == "url":
+            r = requests.get(file_url)
+            if r.status_code != 200:
+                return jsonify({"error": "Cannot download file from URL"}), 500
+
+            return Response(
+                r.content,
+                headers={"Content-Disposition": f"attachment; filename={original_filename}"},
+                mimetype="application/octet-stream"
+            )
+        
+        abs_path = os.path.join(BASE_DIR, os.path.normpath(relative_path))
+        
+        if not os.path.exists(abs_path):
+            return jsonify({"error": "Encrypted file not found on disk"}), 404
+
+        with open(abs_path, "rb") as f:
+            encrypted_blob = f.read()
+
+        # 4. Split ciphertext + tag (tag is last 16 bytes)
+        if len(encrypted_blob) < 16:
+            return jsonify({"error": "Invalid encrypted file format (too short)"}), 500
+
+        ciphertext = encrypted_blob[:-16]
+        file_tag = encrypted_blob[-16:]   # GCM tag is 16 bytes
+
+        # Validate tag size
+        if len(file_tag) != 16:
+            return jsonify({"error": "Invalid tag size"}), 500
+
+        # 5. Decrypt AES-GCM
+
+        try:
+            print(f"Decrypting: key_len={len(aes_key)}, iv_len={len(iv)}, ciphertext_len={len(ciphertext)}, tag_len={len(file_tag)}")
+            cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+            decrypted = cipher.decrypt_and_verify(ciphertext, file_tag)
+            print("Decryption successful!")
+        except ValueError as e:
+            print(f"Decryption error (MAC check failed): {e}")
+            print(f"Key: {aes_key[:8]}... (length: {len(aes_key)})")
+            print(f"IV: {iv[:8]}... (length: {len(iv)})")
+            print(f"Ciphertext length: {len(ciphertext)}")
+            print(f"Tag: {file_tag.hex()}")
+            return jsonify({"error": f"Decryption failed (MAC check failed): {str(e)}"}), 500
+        except Exception as e:
+            print(f"Unexpected decryption error: {e}")
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
+
+        # 6. Return file with original filename
+        filename = original_filename if original_filename else os.path.basename(relative_path)
+
+        return Response(
+            decrypted,
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            mimetype="application/octet-stream"
+        )
+
+    except ValueError as e:
+        print(f"ValueError in download_secure: {e}")
+        return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
+
+    except Exception as e:
+        print(f"Exception in download_secure: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000, ssl_context=('cert.pem', 'key.pem')) 
