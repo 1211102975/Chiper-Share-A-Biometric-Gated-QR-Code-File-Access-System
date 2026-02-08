@@ -4,3 +4,15 @@ opencv-python
 numpy
 Flask==3.0.0
 pyOpenSSL==24.0.0
+Flask-WTF
+Werkzeug
+face_recognition
+opencv-python
+numpy
+mediapipe
+pycryptodome
+qrcode
+pyzbar
+requests
+Pillow
+

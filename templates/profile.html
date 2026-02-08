@@ -388,6 +388,7 @@
                     <div id="profileAlert" class="alert" style="display: none;" role="alert"></div>
                     
                     <form id="editProfileForm" enctype="multipart/form-data">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <!-- Profile Picture -->
                         <div class="mb-4 text-center">
                             <label for="profilePictureInput" class="d-block">
@@ -478,11 +479,11 @@
                         </div>
                     </form>
                 </div>
-                <div class="modal-footer" style="border-top: none; padding: 1.5rem 2rem 2rem;">
+                        <div class="modal-footer" style="border-top: none; padding: 1.5rem 2rem 2rem;">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
                         <i class="bi bi-x-circle"></i> Cancel
                     </button>
-                    <button type="button" class="btn btn-primary" onclick="updateProfile()">
+                    <button type="button" class="btn btn-primary" onclick="updateProfile(this)">
                         <i class="bi bi-check-circle"></i> Save Changes
                     </button>
                 </div>
@@ -513,7 +514,7 @@
             }, 5000);
         }
 
-        function updateProfile() {
+        function updateProfile(button) {
             const form = document.getElementById('editProfileForm');
             const formData = new FormData(form);
             
@@ -530,16 +531,33 @@
             formData.delete('confirm_password');
             
             // Show loading state
-            const saveButton = event.target;
-            const originalText = saveButton.innerHTML;
-            saveButton.disabled = true;
-            saveButton.innerHTML = '<i class="bi bi-hourglass-split"></i> Saving...';
+            const saveButton = button || document.querySelector('#editProfileModal .btn.btn-primary');
+            const originalText = saveButton ? saveButton.innerHTML : '';
+            if (saveButton) {
+                saveButton.disabled = true;
+                saveButton.innerHTML = '<i class="bi bi-hourglass-split"></i> Saving...';
+            }
             
             fetch('/update_profile', {
                 method: 'POST',
                 body: formData
             })
-            .then(response => response.json())
+            .then(response => {
+                // Check if response is JSON
+                const contentType = response.headers.get('content-type');
+                if (contentType && contentType.includes('application/json')) {
+                    return response.json();
+                } else {
+                    // If not JSON, try to get text
+                    return response.text().then(text => {
+                        try {
+                            return JSON.parse(text);
+                        } catch {
+                            return { error: text || 'Server error occurred' };
+                        }
+                    });
+                }
+            })
             .then(data => {
                 if (data.success) {
                     showAlert(data.message || 'Profile updated successfully!', 'success');
@@ -548,15 +566,19 @@
                     }, 1500);
                 } else {
                     showAlert(data.error || 'Failed to update profile', 'danger');
-                    saveButton.disabled = false;
-                    saveButton.innerHTML = originalText;
+                    if (saveButton) {
+                        saveButton.disabled = false;
+                        saveButton.innerHTML = originalText;
+                    }
                 }
             })
             .catch(error => {
                 console.error('Error:', error);
-                showAlert('An error occurred while updating your profile', 'danger');
-                saveButton.disabled = false;
-                saveButton.innerHTML = originalText;
+                showAlert('An error occurred while updating your profile: ' + error.message, 'danger');
+                if (saveButton) {
+                    saveButton.disabled = false;
+                    saveButton.innerHTML = originalText;
+                }
             });
         }
 
