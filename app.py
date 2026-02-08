@@ -44,7 +44,7 @@ from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from Crypto.Util.Padding import pad, unpad
 from flask_wtf import CSRFProtect
-from flask_wtf.csrf import validate_csrf
+from flask_wtf.csrf import validate_csrf, CSRFError
 from wtforms.validators import ValidationError
 
 
@@ -95,6 +95,15 @@ def add_security_headers(response):
         "form-action 'self'"
     )
     return response
+
+# Error handler for CSRF validation errors
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    """Handle CSRF validation errors and return JSON for AJAX requests"""
+    if request.path == '/update_profile':
+        print(f"CSRF Error on /update_profile: {str(e)}")
+        return jsonify({'error': 'CSRF token validation failed. Please refresh the page and try again.'}), 400
+    return jsonify({'error': 'CSRF token validation failed'}), 400
 
 
 def generate_otp():
@@ -216,17 +225,12 @@ def sanitize_input(value):
     return value
 
 @app.route('/login', methods=['GET', 'POST'])
-@csrf.exempt
+
 def login():
     
     if request.method == 'GET':
         return render_template('login.html')
 
-    if request.method == 'POST':
-        try:
-            validate_csrf(request.form.get('csrf_token'))
-        except ValidationError:
-            return render_template("login.html", error="Invalid CSRF token"), 400
 
     # Normalize email (lowercase and strip) to match registration
     email = sanitize_input(request.form.get('email', '')).strip().lower()
@@ -282,21 +286,38 @@ def login():
 @app.route('/profile_picture/<int:user_id>')
 @login_required
 def get_profile_picture(user_id):
+    """
+    Serve the user's profile picture from the static folder.
+    The database stores a relative path like 'profile_pics/filename.jpg'.
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT profile_pic_path
+    cursor.execute(
+        """
+        SELECT COALESCE(profile_pic_path, 'profile_pics/default.jpg')
         FROM Users WHERE user_id = ?
-    """, user_id)
+        """,
+        user_id,
+    )
 
     row = cursor.fetchone()
     conn.close()
 
-    if not row or not row[0]:
-        return '', 404
+    # Fall back to default if nothing found
+    rel_path = row[0] if row and row[0] else "profile_pics/default.jpg"
 
-    return Response(row[0], mimetype=row[1])
+    # Map DB path (e.g. 'profile_pics/foo.jpg') to 'static/profile_pics/foo.jpg'
+    abs_path = os.path.join(BASE_DIR, "static", rel_path.replace("\\", "/"))
+
+    if not os.path.exists(abs_path):
+        # If the stored file is missing, fall back to default
+        default_path = os.path.join(BASE_DIR, "static", "profile_pics", "default.jpg")
+        if os.path.exists(default_path):
+            return send_file(default_path)
+        return "", 404
+
+    return send_file(abs_path)
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -408,6 +429,11 @@ def profile():
 def update_profile():
     """Update user's profile information"""
     try:
+        print(f"DEBUG: Received request to update_profile")
+        print(f"DEBUG: Form data keys: {list(request.form.keys())}")
+        print(f"DEBUG: Files keys: {list(request.files.keys())}")
+        print(f"DEBUG: CSRF token present: {'csrf_token' in request.form}")
+        
         user_id = session.get('user_id')
         if not user_id:
             return jsonify({'error': 'User session expired'}), 401
@@ -599,22 +625,22 @@ def download_file(file_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT file_blob, file_name, file_mime
-        FROM Files
-        WHERE file_id = ?
-    """, file_id)
+         FROM Files
+         WHERE file_id = ?
+     """, file_id)
     row = cursor.fetchone()
     conn.close()
 
     if not row:
-        return "File not found", 404
+         return "File not found", 404
 
     return Response(
-        row[0],
-        mimetype=row[2],
-        headers={
-            "Content-Disposition": f"attachment; filename={row[1]}"
-        }
-    )
+         row[0],
+         mimetype=row[2],
+         headers={
+             "Content-Disposition": f"attachment; filename={row[1]}"
+         }
+     )
 
 
 # Email configuration
@@ -685,6 +711,30 @@ This code is valid for 5 minutes.
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/qr/<int:qr_id>')
+@login_required
+def get_qr(qr_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT qr_image_path
+        FROM QRCode
+        WHERE qr_id = ?
+    """, qr_id)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return "QR not found", 404
+
+    qr_path = row[0]
+    abs_path = os.path.join(app.root_path, qr_path)
+
+    return send_file(abs_path, mimetype="image/png")
+
 
 @app.route('/upload', methods=['POST'])
 @login_required
@@ -909,31 +959,6 @@ def upload():
     finally:
         conn.close()
 
-    
-@app.route('/qr/<int:qr_id>')
-@login_required
-def get_qr(qr_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT qr_image_path
-        FROM QRCode
-        WHERE qr_id = ?
-    """, qr_id)
-
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        return "QR not found", 404
-
-    qr_path = row[0]
-    abs_path = os.path.join(app.root_path, qr_path)
-
-    return send_file(abs_path, mimetype="image/png")
-
-
 
 @app.route('/scan', methods=['POST'])
 @csrf.exempt
@@ -952,8 +977,15 @@ def scan_qr():
         qr_data = json.loads(decoded[0].data.decode("utf-8"))
 
         # Check expiry
-        if datetime.now() > datetime.fromisoformat(qr_data["expiry"]):
-            return jsonify({"expired": True, "message": "QR code expired"}), 200
+
+        expiry = datetime.fromisoformat(qr_data["expiry"])
+
+        if datetime.now() > expiry:
+            return jsonify({
+                "expired": True,
+                "message": "QR code expired"
+            }), 400
+
 
         session["qr_data"] = qr_data
         session["otp_sent"] = False
@@ -963,7 +995,6 @@ def scan_qr():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 # =========================
 # FACE → OTP
@@ -1019,7 +1050,7 @@ def verify_face_stream():
     cursor = conn.cursor()
     
     try:
-        # First check session (quick check before DB lock)
+        # Fast-path: Check session first (quick check before DB lock)
         if session.get("otp_sent") == True:
             log_id = session.get("log_id")
             if log_id:
@@ -1029,13 +1060,15 @@ def verify_face_stream():
                     WHERE log_id = ? AND file_id = ? AND receiver_email = ?
                 """, (log_id, file_id, receiver_email))
                 existing = cursor.fetchone()
+                conn.close()
                 
                 if existing and existing[2] == "Sent":
-                    conn.close()
+                    print("✅ OTP already sent (session check)")
                     return jsonify({"success": True, "otp_sent": True}), 200
 
         # Check database for existing unverified OTP with UPDLOCK to prevent race conditions
         # UPDLOCK locks the rows until transaction commits, preventing concurrent inserts
+        # This is the critical section - only one request can proceed past this point
         cursor.execute("""
             SELECT TOP 1 log_id, otp_code, otp_status, otp_created_at
             FROM AccessLog WITH (UPDLOCK, ROWLOCK)
@@ -1051,15 +1084,16 @@ def verify_face_stream():
             log_id, otp, otp_status, otp_created_at = existing_record
             
             # Don't send email again if OTP was recently created (within last 5 minutes)
-            should_send_email = True
+            should_send_email = False  # Default to False to prevent duplicates
             if otp_created_at is not None:
                 try:
                     # Handle both datetime and string formats
                     if isinstance(otp_created_at, str):
                         otp_created_at = datetime.fromisoformat(otp_created_at.replace('Z', '+00:00'))
                     time_diff = (datetime.now() - otp_created_at).total_seconds()
-                    if time_diff < 300:  # Don't resend if sent within last 5 minutes
-                        should_send_email = False
+                    # Only resend if OTP is older than 5 minutes (user might have lost email)
+                    if time_diff >= 300:
+                        should_send_email = True
                 except Exception as e:
                     print(f"Error checking OTP timestamp: {e}")
             
@@ -1068,16 +1102,18 @@ def verify_face_stream():
             
             # Update session
             session["log_id"] = log_id
-            session["otp_sent"] = True
+            session.modified = True
             
-            # Send email only if needed
+            # Send email only if needed (OTP is old)
             if should_send_email:
-                print("📧 Resending OTP email to:", receiver_email)
+                print("📧 Resending OTP email (OTP expired) to:", receiver_email)
                 try:
                     send_otp_email(receiver_email, otp)
                     print("📧 Email sent successfully!")
                 except Exception as e:
                     print("Email error:", e)
+            else:
+                print("✅ OTP already exists and is recent, not resending email")
             
             return jsonify({"success": True, "otp_sent": True})
 
@@ -1103,11 +1139,11 @@ def verify_face_stream():
         conn.commit()
         conn.close()
 
-        # Save log_id + mark OTP sent (AFTER successful commit)
+        # Save log_id (AFTER successful commit)
         session["log_id"] = log_id
-        session["otp_sent"] = True
+        session.modified = True
 
-        print("📧 Sending email to:", receiver_email)
+        print("📧 Sending OTP email to:", receiver_email)
         try:
             send_otp_email(receiver_email, otp)
             print("📧 Email sent successfully!")
@@ -1119,11 +1155,13 @@ def verify_face_stream():
     except Exception as e:
         conn.rollback()
         conn.close()
+        # Reset session flag on error so user can retry
+        session["otp_sent"] = False
+        session.modified = True
         print(f"Error in OTP generation: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": "Failed to generate OTP"}), 500
-
 
 
 @app.route('/send_otp', methods=['POST'])
@@ -1157,6 +1195,7 @@ def verify_otp():
 
         if not log_id:
             return jsonify({"error": "No OTP session"}), 400
+        
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1254,176 +1293,293 @@ def verify_otp():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+# test_otp_verify
+# @app.route("/verify_otp", methods=["POST"])
+# @csrf.exempt
+# def verify_otp():
+#     try:
+#         log_id = session.get("log_id")
+#         if not log_id:
+#             return jsonify({"error": "No OTP session"}), 400
 
+#         user_otp = request.form.get("otp")
+#         if not user_otp:
+#             return jsonify({"error": "OTP required"}), 400
 
+#         conn = get_db_connection()
+#         cursor = conn.cursor()
+#         cursor.execute("""
+#             SELECT otp_code, otp_status
+#             FROM AccessLog
+#             WHERE log_id=?
+#         """, (log_id,))
+#         row = cursor.fetchone()
+
+#         if not row:
+#             conn.close()
+#             return jsonify({"error": "Invalid OTP session"}), 400
+
+#         db_otp, status = row
+
+#         # Already verified
+#         if status == "Verified":
+#             conn.close()
+#             return jsonify({"success": True})
+
+#         # Wrong OTP
+#         if user_otp != db_otp:
+#             conn.close()
+#             return jsonify({"error": "Incorrect OTP"}), 200
+
+#         # Correct OTP
+#         cursor.execute("""
+#             UPDATE AccessLog
+#             SET otp_status='Verified'
+#             WHERE log_id=?
+#         """, (log_id,))
+#         conn.commit()
+#         conn.close()
+
+#         return jsonify({"success": True})
+
+#     except Exception as e:
+#         print("OTP ERROR:", e)
+#         return jsonify({"error": "OTP verification failed"}), 500
+    
 @app.route("/download_secure")
 def download_secure_file():
     try:
-        qr = session.get("qr_data")
-        if not qr:
-            return jsonify({"error": "No QR session"}), 400
+         qr = session.get("qr_data")
+         if not qr:
+             return jsonify({"error": "No QR session"}), 400
 
-        file_id = qr["file_id"]
-        receiver_email = qr["receiver_email"]
+         file_id = qr["file_id"]
+         receiver_email = qr["receiver_email"]
 
-        # Check if OTP has been verified
-        log_id = session.get("log_id")
-        if not log_id:
-            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
+         # Check if OTP has been verified
+         log_id = session.get("log_id")
+         if not log_id:
+             return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
+         conn = get_db_connection()
+         cursor = conn.cursor()
 
-        # Verify OTP was verified for this file
-        cursor.execute("""
-            SELECT otp_status, access_result
-            FROM AccessLog
-            WHERE log_id = ? AND file_id = ? AND receiver_email = ?
-        """, (log_id, file_id, receiver_email))
+         # Verify OTP was verified for this file
+         cursor.execute("""
+             SELECT otp_status, access_result
+             FROM AccessLog
+             WHERE log_id = ? AND file_id = ? AND receiver_email = ?
+         """, (log_id, file_id, receiver_email))
         
-        access_row = cursor.fetchone()
-        if not access_row or access_row[0] != "Verified":
-            conn.close()
-            return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
+         access_row = cursor.fetchone()
+         if not access_row or access_row[0] != "Verified":
+             conn.close()
+             return jsonify({"error": "OTP not verified. Please verify OTP first."}), 403
 
-        # 1. Fetch file path and original filename
-        cursor.execute("""
-            SELECT file_path, file_name, file_url, file_source 
-            FROM Files WHERE file_id=?
-        """, (file_id,))
+         # 1. Fetch file path and original filename
+         cursor.execute("""
+             SELECT file_path, file_name, file_url, file_source 
+             FROM Files WHERE file_id=?
+         """, (file_id,))
 
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return jsonify({"error": "File not found"}), 404
+         row = cursor.fetchone()
+         if not row:
+             conn.close()
+             return jsonify({"error": "File not found"}), 404
 
-        file_path, original_filename, file_url, file_source = row
+         file_path, original_filename, file_url, file_source = row
 
-        relative_path, original_filename = row[0], row[1]
+         relative_path, original_filename = row[0], row[1]
 
-        # 2. Fetch AES keys
-        cursor.execute(
-            "SELECT aes_key, iv, tag FROM FileKey WHERE file_id=?",
-            (file_id,)
-        )
-        key_row = cursor.fetchone()
-        conn.close()
+         # 2. Fetch AES keys
+         cursor.execute(
+             "SELECT aes_key, iv, tag FROM FileKey WHERE file_id=?",
+             (file_id,)
+         )
+         key_row = cursor.fetchone()
+         conn.close()
 
-        if not key_row:
-            return jsonify({"error": "Missing AES key"}), 500
+         if not key_row:
+             return jsonify({"error": "Missing AES key"}), 500
 
-        aes_key, iv, tag_db = key_row  # tag_db stored but not used (tag is in file)
+         aes_key, iv, tag_db = key_row  # tag_db stored but not used (tag is in file)
 
-        # Ensure aes_key and iv are bytes (they might be stored as VARBINARY)
-        if isinstance(aes_key, bytes):
-            pass  # Already bytes
-        elif isinstance(aes_key, bytearray):
-            aes_key = bytes(aes_key)
-        else:
-            # Try to convert from string/other format
-            try:
-                if isinstance(aes_key, str):
-                    aes_key = aes_key.encode('latin-1')
-                else:
-                    aes_key = bytes(aes_key)
-            except Exception as e:
-                print(f"Error converting aes_key to bytes: {e}")
-                return jsonify({"error": "Invalid AES key format"}), 500
+         # Ensure aes_key and iv are bytes (they might be stored as VARBINARY)
+         if isinstance(aes_key, bytes):
+             pass  # Already bytes
+         elif isinstance(aes_key, bytearray):
+             aes_key = bytes(aes_key)
+         else:
+             # Try to convert from string/other format
+             try:
+                 if isinstance(aes_key, str):
+                     aes_key = aes_key.encode('latin-1')
+                 else:
+                     aes_key = bytes(aes_key)
+             except Exception as e:
+                 print(f"Error converting aes_key to bytes: {e}")
+                 return jsonify({"error": "Invalid AES key format"}), 500
 
-        if isinstance(iv, bytes):
-            pass  # Already bytes
-        elif isinstance(iv, bytearray):
-            iv = bytes(iv)
-        else:
-            # Try to convert from string/other format
-            try:
-                if isinstance(iv, str):
-                    iv = iv.encode('latin-1')
-                else:
-                    iv = bytes(iv)
-            except Exception as e:
-                print(f"Error converting IV to bytes: {e}")
-                return jsonify({"error": "Invalid IV format"}), 500
+         if isinstance(iv, bytes):
+             pass  # Already bytes
+         elif isinstance(iv, bytearray):
+             iv = bytes(iv)
+         else:
+             # Try to convert from string/other format
+             try:
+                 if isinstance(iv, str):
+                     iv = iv.encode('latin-1')
+                 else:
+                     iv = bytes(iv)
+             except Exception as e:
+                 print(f"Error converting IV to bytes: {e}")
+                 return jsonify({"error": "Invalid IV format"}), 500
 
-        # Validate key and IV sizes
-        if len(aes_key) != 32:
-            print(f"Invalid AES key length: {len(aes_key)}, expected 32")
-            return jsonify({"error": "Invalid AES key size"}), 500
+         # Validate key and IV sizes
+         if len(aes_key) != 32:
+             print(f"Invalid AES key length: {len(aes_key)}, expected 32")
+             return jsonify({"error": "Invalid AES key size"}), 500
         
-        if len(iv) != 12:
-            print(f"Invalid IV length: {len(iv)}, expected 12")
-            return jsonify({"error": "Invalid IV size"}), 500
+         if len(iv) != 12:
+             print(f"Invalid IV length: {len(iv)}, expected 12")
+             return jsonify({"error": "Invalid IV size"}), 500
 
-        # 3. Load encrypted file from disk
-        # If file is URL type → return immediately (no decryption)
-        if file_source == "url":
-            r = requests.get(file_url)
-            if r.status_code != 200:
-                return jsonify({"error": "Cannot download file from URL"}), 500
+         # 3. Load encrypted file from disk
+         # If file is URL type → return immediately (no decryption)
+         if file_source == "url":
+             r = requests.get(file_url)
+             if r.status_code != 200:
+                 return jsonify({"error": "Cannot download file from URL"}), 500
 
-            return Response(
-                r.content,
-                headers={"Content-Disposition": f"attachment; filename={original_filename}"},
-                mimetype="application/octet-stream"
-            )
+             return Response(
+                 r.content,
+                 headers={"Content-Disposition": f"attachment; filename={original_filename}"},
+                 mimetype="application/octet-stream"
+             )
         
-        abs_path = os.path.join(BASE_DIR, os.path.normpath(relative_path))
+         abs_path = os.path.join(BASE_DIR, os.path.normpath(relative_path))
         
-        if not os.path.exists(abs_path):
-            return jsonify({"error": "Encrypted file not found on disk"}), 404
+         if not os.path.exists(abs_path):
+             return jsonify({"error": "Encrypted file not found on disk"}), 404
 
-        with open(abs_path, "rb") as f:
-            encrypted_blob = f.read()
+         with open(abs_path, "rb") as f:
+             encrypted_blob = f.read()
 
-        # 4. Split ciphertext + tag (tag is last 16 bytes)
-        if len(encrypted_blob) < 16:
-            return jsonify({"error": "Invalid encrypted file format (too short)"}), 500
+         # 4. Split ciphertext + tag (tag is last 16 bytes)
+         if len(encrypted_blob) < 16:
+             return jsonify({"error": "Invalid encrypted file format (too short)"}), 500
 
-        ciphertext = encrypted_blob[:-16]
-        file_tag = encrypted_blob[-16:]   # GCM tag is 16 bytes
+         ciphertext = encrypted_blob[:-16]
+         file_tag = encrypted_blob[-16:]   # GCM tag is 16 bytes
 
-        # Validate tag size
-        if len(file_tag) != 16:
-            return jsonify({"error": "Invalid tag size"}), 500
+         # Validate tag size
+         if len(file_tag) != 16:
+             return jsonify({"error": "Invalid tag size"}), 500
 
-        # 5. Decrypt AES-GCM
+         # 5. Decrypt AES-GCM
 
-        try:
-            print(f"Decrypting: key_len={len(aes_key)}, iv_len={len(iv)}, ciphertext_len={len(ciphertext)}, tag_len={len(file_tag)}")
-            cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
-            decrypted = cipher.decrypt_and_verify(ciphertext, file_tag)
-            print("Decryption successful!")
-        except ValueError as e:
-            print(f"Decryption error (MAC check failed): {e}")
-            print(f"Key: {aes_key[:8]}... (length: {len(aes_key)})")
-            print(f"IV: {iv[:8]}... (length: {len(iv)})")
-            print(f"Ciphertext length: {len(ciphertext)}")
-            print(f"Tag: {file_tag.hex()}")
-            return jsonify({"error": f"Decryption failed (MAC check failed): {str(e)}"}), 500
-        except Exception as e:
-            print(f"Unexpected decryption error: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
+         try:
+             print(f"Decrypting: key_len={len(aes_key)}, iv_len={len(iv)}, ciphertext_len={len(ciphertext)}, tag_len={len(file_tag)}")
+             cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+             decrypted = cipher.decrypt_and_verify(ciphertext, file_tag)
+             print("Decryption successful!")
+         except ValueError as e:
+             print(f"Decryption error (MAC check failed): {e}")
+             print(f"Key: {aes_key[:8]}... (length: {len(aes_key)})")
+             print(f"IV: {iv[:8]}... (length: {len(iv)})")
+             print(f"Ciphertext length: {len(ciphertext)}")
+             print(f"Tag: {file_tag.hex()}")
+             return jsonify({"error": f"Decryption failed (MAC check failed): {str(e)}"}), 500
+         except Exception as e:
+             print(f"Unexpected decryption error: {e}")
+             import traceback
+             traceback.print_exc()
+             return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
 
-        # 6. Return file with original filename
-        filename = original_filename if original_filename else os.path.basename(relative_path)
+         # 6. Return file with original filename
+         filename = original_filename if original_filename else os.path.basename(relative_path)
 
-        return Response(
-            decrypted,
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
-            mimetype="application/octet-stream"
-        )
+         return Response(
+             decrypted,
+             headers={"Content-Disposition": f"attachment; filename={filename}"},
+             mimetype="application/octet-stream"
+         )
 
     except ValueError as e:
-        print(f"ValueError in download_secure: {e}")
-        return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
+         print(f"ValueError in download_secure: {e}")
+         return jsonify({"error": f"Decryption failed: {str(e)}"}), 500
 
     except Exception as e:
-        print(f"Exception in download_secure: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+         print(f"Exception in download_secure: {e}")
+         import traceback
+         traceback.print_exc()
+         return jsonify({"error": f"Download failed: {str(e)}"}), 500
+     
+# test_download, test_download_blocked
+# @app.route("/download")
+# def download_file():
+
+#     # 🔐 Must have passed OTP
+#     if session.get("otp_verified") is not True:
+#         return jsonify({"error": "OTP not verified"}), 403
+
+#     qr = session.get("qr_data")
+#     if not qr:
+#         return jsonify({"error": "No QR session"}), 400
+
+#     file_id = qr["file_id"]
+
+#     conn = get_db_connection()
+#     cursor = conn.cursor()
+
+#     # 1️⃣ Get encrypted file path
+#     cursor.execute("""
+#         SELECT file_path, file_name, file_mime
+#         FROM Files
+#         WHERE file_id = ?
+#     """, (file_id,))
+#     row = cursor.fetchone()
+
+#     if not row:
+#         conn.close()
+#         return jsonify({"error": "File not found"}), 404
+
+#     file_path, file_name, file_mime = row
+
+#     # 2️⃣ Get AES key + IV + GCM tag
+#     cursor.execute("""
+#         SELECT aes_key, iv, tag
+#         FROM FileKey
+#         WHERE file_id = ?
+#     """, (file_id,))
+#     keyrow = cursor.fetchone()
+#     conn.close()
+
+#     if not keyrow:
+#         return jsonify({"error": "Missing encryption key"}), 500
+
+#     aes_key, iv, tag = keyrow
+
+#     # 3️⃣ Read encrypted file from disk
+#     abs_path = os.path.join(app.root_path, file_path.lstrip("/"))
+
+#     with open(abs_path, "rb") as f:
+#         encrypted_data = f.read()
+
+#     # 4️⃣ AES-256-GCM decrypt
+#     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+#     aes = AESGCM(aes_key)
+#     decrypted = aes.decrypt(iv, encrypted_data, tag)
+
+#     # 5️⃣ Send decrypted file
+#     return send_file(
+#         io.BytesIO(decrypted),
+#         download_name=file_name or "decrypted_file",
+#         mimetype=file_mime or "application/octet-stream",
+#         as_attachment=True
+#     )
 
 
 if __name__ == '__main__':

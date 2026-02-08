@@ -810,31 +810,46 @@
                 canvas.getContext("2d").drawImage(video, 0, 0);
 
                 canvas.toBlob(async (blob) => {
-                    if (!blob || faceVerificationComplete) return;
+                    // Prevent concurrent requests - check flags BEFORE async operation
+                    if (!blob || faceVerificationComplete || otpRequestInProgress) return;
 
-                    const formData = new FormData();
-                    formData.append("frame", blob);
+                    // Set flag immediately to prevent concurrent requests
+                    otpRequestInProgress = true;
 
-                    const res = await fetch("/verify_face_stream", {
-                        method: "POST",
-                        body: formData
-                    });
+                    try {
+                        const formData = new FormData();
+                        formData.append("frame", blob);
 
-                    const data = await res.json();
+                        const res = await fetch("/verify_face_stream", {
+                            method: "POST",
+                            body: formData
+                        });
 
-                    if (data.success && !faceVerificationComplete) {
+                        const data = await res.json();
 
-                        // MARK face verification done
-                        faceVerificationComplete = true;
-                        isVerifying = false;
+                        if (data.success && !faceVerificationComplete) {
 
-                        // STOP interval IMMEDIATELY
-                        stopFaceVerification();
-                        stopCamera();
+                            // MARK face verification done
+                            faceVerificationComplete = true;
+                            isVerifying = false;
 
-                        // SHOW OTP UI
-                        document.getElementById("faceVerification").style.display = "none";
-                        document.getElementById("otpVerification").style.display = "block";
+                            // STOP interval IMMEDIATELY
+                            stopFaceVerification();
+                            stopCamera();
+
+                            // SHOW OTP UI
+                            document.getElementById("faceVerification").style.display = "none";
+                            document.getElementById("otpVerification").style.display = "block";
+                        }
+                    } catch (error) {
+                        console.error("Face verification error:", error);
+                        // Reset flag on error so user can retry
+                        otpRequestInProgress = false;
+                    } finally {
+                        // Only reset flag if verification didn't complete
+                        if (!faceVerificationComplete) {
+                            otpRequestInProgress = false;
+                        }
                     }
                 });
 
